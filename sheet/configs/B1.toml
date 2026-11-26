@@ -1,0 +1,6 @@
+# Byte-level fuzzing from the provided seed corpus.
+name = "B1"
+kind = "libfuzzer"
+trials = 3
+duration_s = 60
+extra_args = ["-max_len=128", "-rss_limit_mb=4096"]
