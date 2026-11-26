@@ -36,4 +36,20 @@ def generate(rng: random.Random, *, max_depth: int = 20) -> str:
 
     All randomness must come from `rng`, so that a seed reproduces a corpus.
     """
-    raise NotImplementedError("Phase 2: implement random derivation from GRAMMAR")
+    # raise NotImplementedError("Phase 2: implement random derivation from GRAMMAR")
+    input = START
+    depth = 0
+    hasNonTerm = True
+    while hasNonTerm:
+      hasNonTerm = False
+      depth += 1
+      for symbol in input:
+        if is_nonterminal(symbol):
+          hasNonTerm = True
+          if depth > max_depth:
+            symbol = cheapest_expansions(symbol) 
+          else:
+            expOptions = GRAMMAR[symbol]
+            symbol = expOptions[rng.randint(0, GRAMMAR[symbol].__len__-1)]
+    return input
+        
