@@ -1,0 +1,2022 @@
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/dependencies.cpp:
+    1|       |// Stage Dependencies: builds the dependency graph, rejects cycles and orders
+    2|       |// cells so that each comes after every cell it reads.
+    3|       |//
+    4|       |// Only cells that take part in a reference get a graph node; isolated cells
+    5|       |// (typically constants nobody reads) skip the graph and are ordered first.
+    6|       |
+    7|       |#include <algorithm>
+    8|       |#include <cstdint>
+    9|       |#include <deque>
+   10|       |#include <format>
+   11|       |#include <limits>
+   12|       |#include <optional>
+   13|       |#include <utility>
+   14|       |#include <vector>
+   15|       |
+   16|       |#include "analysis.hpp"
+   17|       |
+   18|       |namespace sheet::detail {
+   19|       |namespace {
+   20|       |
+   21|       |// Typical sheets have fewer cells than this in their dependency graph.
+   22|       |inline constexpr std::size_t expected_graph_size = 64;
+   23|       |
+   24|       |struct GraphNode {
+   25|       |  std::size_t definition;
+   26|       |  std::vector<std::size_t> dependents;  // node indices of cells that read this one
+   27|       |  std::size_t unresolved = 0;           // dependencies not yet ordered
+   28|       |};
+   29|       |
+   30|       |class DependencyGraph {
+   31|       |public:
+   32|       |  DependencyGraph(const Ast& ast, const CellIndex& index)
+   33|     22|      : ast_{&ast}, index_{&index}, node_of_(ast.cells().size()) {
+   34|     22|    nodes_.reserve(expected_graph_size);
+   35|     22|  }
+   36|       |
+   37|     22|  auto order() -> std::expected<std::vector<std::size_t>, Diagnostic> {
+   38|     22|    build();
+   39|       |
+   40|     22|    std::vector<std::size_t> order;
+   41|     22|    order.reserve(node_of_.size());
+   42|    101|    for (std::size_t i = 0; i < node_of_.size(); ++i) {
+   43|     79|      if (!node_of_[i]) {
+   44|     11|        order.push_back(i);
+   45|     11|      }
+   46|     79|    }
+   47|       |
+   48|       |    // Kahn's algorithm over the graph, in node creation order for determinism.
+   49|     22|    std::deque<std::size_t> ready;
+   50|     90|    for (std::size_t n = 0; n < nodes_.size(); ++n) {
+   51|     68|      if (nodes_[n].unresolved == 0) {
+   52|     29|        ready.push_back(n);
+   53|     29|      }
+   54|     68|    }
+   55|     90|    while (!ready.empty()) {
+   56|     68|      const auto n = ready.front();
+   57|     68|      ready.pop_front();
+   58|     68|      order.push_back(nodes_[n].definition);
+   59|     68|      for (const auto dependent : nodes_[n].dependents) {
+   60|     55|        if (--nodes_[dependent].unresolved == 0) {
+   61|     39|          ready.push_back(dependent);
+   62|     39|        }
+   63|     55|      }
+   64|     68|    }
+   65|       |
+   66|     22|    if (order.size() != node_of_.size()) {
+   67|      0|      return std::unexpected(cycle_error());
+   68|      0|    }
+   69|     22|    return order;
+   70|     22|  }
+   71|       |
+   72|       |private:
+   73|       |  // The definitions that cell `definition` reads, without duplicates.
+   74|     79|  [[nodiscard]] auto reads(std::size_t definition) const -> std::vector<std::size_t> {
+   75|     79|    std::vector<std::size_t> result;
+   76|     79|    auto on_cell = [&](CellRef ref) { result.push_back(index_->at(ref)); };
+   77|     79|    auto on_range = [&](const CellRange& range) {
+   78|     19|      for (const auto covered : covered_definitions(*ast_, range)) {
+   79|       |        // A total such as A10 = SUM(A1:A10) does not depend on itself.
+   80|     19|        if (covered == definition) {
+   81|      0|          continue;
+   82|      0|        }
+   83|     19|        result.push_back(covered);
+   84|     19|      }
+   85|     10|    };
+   86|     79|    for_each_reference(*ast_, ast_->cells()[definition].expression, on_cell, on_range);
+   87|     79|    std::ranges::sort(result);
+   88|     79|    const auto duplicates = std::ranges::unique(result);
+   89|     79|    result.erase(duplicates.begin(), duplicates.end());
+   90|     79|    return result;
+   91|     79|  }
+   92|       |
+   93|    165|  auto node_for(std::size_t definition) -> std::size_t {
+   94|    165|    auto& slot = node_of_[definition];
+   95|    165|    if (!slot) {
+   96|     68|      slot = nodes_.size();
+   97|     68|      nodes_.push_back(GraphNode{.definition = definition, .dependents = {}});
+   98|     68|    }
+   99|    165|    return *slot;
+  100|    165|  }
+  101|       |
+  102|     22|  auto build() -> void {
+  103|    101|    for (std::size_t i = 0; i < node_of_.size(); ++i) {
+  104|     79|      for (const auto read : reads(i)) {
+  105|     55|        nodes_[node_for(read)].dependents.push_back(node_for(i));
+  106|     55|        ++nodes_[node_for(i)].unresolved;
+  107|     55|      }
+  108|     79|    }
+  109|     22|  }
+  110|       |
+  111|      0|  [[nodiscard]] auto cycle_error() const -> Diagnostic {
+  112|       |    // Report the earliest-defined cell still waiting on a dependency.
+  113|      0|    auto earliest = std::numeric_limits<std::size_t>::max();
+  114|      0|    for (const auto& node : nodes_) {
+  115|      0|      if (node.unresolved > 0) {
+  116|      0|        earliest = std::min(earliest, node.definition);
+  117|      0|      }
+  118|      0|    }
+  119|      0|    const auto& definition = ast_->cells()[earliest];
+  120|      0|    return Diagnostic{
+  121|      0|        Stage::Dependencies,
+  122|      0|        std::format("circular reference involving cell {}", to_string(definition.target)),
+  123|      0|        definition.location};
+  124|      0|  }
+  125|       |
+  126|       |  const Ast* ast_;
+  127|       |  const CellIndex* index_;
+  128|       |  std::vector<std::optional<std::size_t>> node_of_;  // by definition index
+  129|       |  std::vector<GraphNode> nodes_;
+  130|       |};
+  131|       |
+  132|       |}  // namespace
+  133|       |
+  134|       |auto order_cells(const Ast& ast, const CellIndex& index)
+  135|     22|    -> std::expected<std::vector<std::size_t>, Diagnostic> {
+  136|     22|  return DependencyGraph{ast, index}.order();
+  137|     22|}
+  138|       |
+  139|       |}  // namespace sheet::detail
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/cell_range.cpp:
+    1|       |#include <algorithm>
+    2|       |#include <utility>
+    3|       |
+    4|       |#include "analysis.hpp"
+    5|       |
+    6|       |namespace sheet::detail {
+    7|       |
+    8|     30|auto normalized(CellRef a, CellRef b) noexcept -> CellRange {
+    9|     30|  return CellRange{
+   10|     30|      CellRef{std::min(a.column, b.column), std::min(a.row, b.row)},
+   11|     30|      CellRef{std::max(a.column, b.column), std::max(a.row, b.row)},
+   12|     30|  };
+   13|     30|}
+   14|       |
+   15|    181|auto contains(const CellRange& range, CellRef ref) noexcept -> bool {
+   16|    181|  return range.first.column <= ref.column && ref.column <= range.last.column &&
+   17|     79|         range.first.row <= ref.row && ref.row <= range.last.row;
+   18|    181|}
+   19|       |
+   20|     38|auto covered_definitions(const Ast& ast, const CellRange& range) -> std::vector<std::size_t> {
+   21|     38|  const auto cells = ast.cells();
+   22|     38|  std::vector<std::size_t> covered;
+   23|    219|  for (std::size_t i = 0; i < cells.size(); ++i) {
+   24|    181|    if (contains(range, cells[i].target)) {
+   25|     71|      covered.push_back(i);
+   26|     71|    }
+   27|    181|  }
+   28|     90|  std::ranges::sort(covered, [&](std::size_t a, std::size_t b) {
+   29|     90|    const auto& lhs = cells[a].target;
+   30|     90|    const auto& rhs = cells[b].target;
+   31|     90|    return std::pair{lhs.row, lhs.column} < std::pair{rhs.row, rhs.column};
+   32|     90|  });
+   33|     38|  return covered;
+   34|     38|}
+   35|       |
+   36|       |}  // namespace sheet::detail
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/invariant.hpp:
+    1|       |#pragma once
+    2|       |
+    3|       |// Internal invariants: conditions that earlier stages guarantee. A violation
+    4|       |// is a bug in the library, never a property of the input, so it aborts in
+    5|       |// every build mode (unlike assert, which NDEBUG removes).
+    6|       |
+    7|       |#include <optional>
+    8|       |#include <source_location>
+    9|       |#include <string_view>
+   10|       |#include <utility>
+   11|       |
+   12|       |namespace sheet::detail {
+   13|       |
+   14|       |[[noreturn]] auto invariant_failure(std::string_view message, std::source_location where) -> void;
+   15|       |
+   16|       |inline auto invariant(bool condition, std::string_view message,
+   17|     70|                      std::source_location where = std::source_location::current()) -> void {
+   18|     70|  if (!condition) {
+   19|      0|    invariant_failure(message, where);
+   20|      0|  }
+   21|     70|}
+   22|       |
+   23|       |// Unwraps an optional that an earlier stage guarantees is engaged.
+   24|       |template <typename T>
+   25|       |[[nodiscard]] auto required(const std::optional<T>& value, std::string_view message,
+   26|       |                            std::source_location where = std::source_location::current())
+   27|    107|    -> const T& {
+   28|    107|  if (!value) {
+   29|      0|    invariant_failure(message, where);
+   30|      0|  }
+   31|    107|  return *value;  // NOLINT(bugprone-unchecked-optional-access): checked above
+   32|    107|}
+  ------------------
+  | _ZN5sheet6detail8requiredISt7variantIJdNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEbNS_10ErrorValueEEEEERKT_RKSt8optionalISB_ESt17basic_string_viewIcS6_ESt15source_location:
+  |   27|     56|    -> const T& {
+  |   28|     56|  if (!value) {
+  |   29|      0|    invariant_failure(message, where);
+  |   30|      0|  }
+  |   31|     56|  return *value;  // NOLINT(bugprone-unchecked-optional-access): checked above
+  |   32|     56|}
+  ------------------
+  | type_check.cpp:_ZN5sheet6detail8requiredINS0_12_GLOBAL__N_14TypeEEERKT_RKSt8optionalIS4_ESt17basic_string_viewIcSt11char_traitsIcEESt15source_location:
+  |   27|     51|    -> const T& {
+  |   28|     51|  if (!value) {
+  |   29|      0|    invariant_failure(message, where);
+  |   30|      0|  }
+  |   31|     51|  return *value;  // NOLINT(bugprone-unchecked-optional-access): checked above
+  |   32|     51|}
+  ------------------
+   33|       |
+   34|       |template <typename T>
+   35|       |[[nodiscard]] auto required(std::optional<T>&& value, std::string_view message,
+   36|    166|                            std::source_location where = std::source_location::current()) -> T {
+   37|    166|  if (!value) {
+   38|      0|    invariant_failure(message, where);
+   39|      0|  }
+   40|    166|  return *std::move(value);  // NOLINT(bugprone-unchecked-optional-access): checked above
+   41|    166|}
+  ------------------
+  | _ZN5sheet6detail8requiredImEET_OSt8optionalIS2_ESt17basic_string_viewIcSt11char_traitsIcEESt15source_location:
+  |   36|     37|                            std::source_location where = std::source_location::current()) -> T {
+  |   37|     37|  if (!value) {
+  |   38|      0|    invariant_failure(message, where);
+  |   39|      0|  }
+  |   40|     37|  return *std::move(value);  // NOLINT(bugprone-unchecked-optional-access): checked above
+  |   41|     37|}
+  ------------------
+  | _ZN5sheet6detail8requiredINS0_12FunctionSpecEEET_OSt8optionalIS3_ESt17basic_string_viewIcSt11char_traitsIcEESt15source_location:
+  |   36|     50|                            std::source_location where = std::source_location::current()) -> T {
+  |   37|     50|  if (!value) {
+  |   38|      0|    invariant_failure(message, where);
+  |   39|      0|  }
+  |   40|     50|  return *std::move(value);  // NOLINT(bugprone-unchecked-optional-access): checked above
+  |   41|     50|}
+  ------------------
+  | _ZN5sheet6detail8requiredISt7variantIJdNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEbNS_10ErrorValueEEEEET_OSt8optionalISB_ESt17basic_string_viewIcS6_ESt15source_location:
+  |   36|     79|                            std::source_location where = std::source_location::current()) -> T {
+  |   37|     79|  if (!value) {
+  |   38|      0|    invariant_failure(message, where);
+  |   39|      0|  }
+  |   40|     79|  return *std::move(value);  // NOLINT(bugprone-unchecked-optional-access): checked above
+  |   41|     79|}
+  ------------------
+   42|       |
+   43|       |}  // namespace sheet::detail
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/types.cpp:
+    1|       |#include "sheet/types.hpp"
+    2|       |
+    3|       |#include <algorithm>
+    4|       |#include <format>
+    5|       |#include <string>
+    6|       |
+    7|       |namespace sheet {
+    8|       |namespace {
+    9|       |
+   10|       |template <typename... Fs>
+   11|       |struct Overloaded : Fs... {
+   12|       |  using Fs::operator()...;
+   13|       |};
+   14|       |
+   15|       |}  // namespace
+   16|       |
+   17|      1|auto to_string(CellRef ref) -> std::string {
+   18|       |  // Bijective base 26: index 0 = A, 25 = Z, 26 = AA.
+   19|      1|  std::string letters;
+   20|      2|  for (auto n = ref.column.index() + 1; n > 0; n = (n - 1) / 26) {
+   21|      1|    letters.push_back(static_cast<char>('A' + (n - 1) % 26));
+   22|      1|  }
+   23|      1|  std::ranges::reverse(letters);
+   24|      1|  return std::format("{}{}", letters, ref.row.number());
+   25|      1|}
+   26|       |
+   27|      0|auto to_string(ErrorValue error) -> std::string_view {
+   28|      0|  switch (error.kind) {
+   29|      0|    case ErrorKind::DivZero: return "#DIV/0";
+   30|      0|    case ErrorKind::Ref: return "#REF";
+   31|      0|    case ErrorKind::Value: return "#VALUE";
+   32|      0|    case ErrorKind::Num: return "#NUM";
+   33|      0|  }
+   34|      0|  return "#ERROR";
+   35|      0|}
+   36|       |
+   37|      0|auto to_string(const Value& value) -> std::string {
+   38|      0|  return std::visit(
+   39|      0|      Overloaded{
+   40|      0|          [](double number) { return std::format("{}", number); },
+   41|      0|          [](const std::string& text) {
+   42|      0|            std::string quoted{"\""};
+   43|      0|            for (const char c : text) {
+   44|      0|              switch (c) {
+   45|      0|                case '"': quoted += "\\\""; break;
+   46|      0|                case '\\': quoted += "\\\\"; break;
+   47|      0|                case '\n': quoted += "\\n"; break;
+   48|      0|                case '\t': quoted += "\\t"; break;
+   49|      0|                default: quoted.push_back(c); break;
+   50|      0|              }
+   51|      0|            }
+   52|      0|            return quoted + "\"";
+   53|      0|          },
+   54|      0|          [](bool flag) { return std::string{flag ? "TRUE" : "FALSE"}; },
+   55|      0|          [](ErrorValue error) { return std::string{to_string(error)}; },
+   56|      0|      },
+   57|      0|      value);
+   58|      0|}
+   59|       |
+   60|       |}  // namespace sheet
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/type_check.cpp:
+    1|       |// Stage Types: every expression has a static type (number, string or bool),
+    2|       |// checked cell by cell in evaluation order. The evaluator relies on these
+    3|       |// guarantees and treats a violation as a bug in the library.
+    4|       |
+    5|       |#include <cstdint>
+    6|       |#include <format>
+    7|       |#include <optional>
+    8|       |#include <string>
+    9|       |#include <string_view>
+   10|       |#include <utility>
+   11|       |#include <variant>
+   12|       |#include <vector>
+   13|       |
+   14|       |#include "analysis.hpp"
+   15|       |#include "functions.hpp"
+   16|       |#include "invariant.hpp"
+   17|       |
+   18|       |namespace sheet::detail {
+   19|       |namespace {
+   20|       |
+   21|       |enum class Type : std::uint8_t { Number, String, Bool };
+   22|       |
+   23|      0|[[nodiscard]] constexpr auto describe(Type type) noexcept -> std::string_view {
+   24|      0|  switch (type) {
+   25|      0|    case Type::Number: return "a number";
+   26|      0|    case Type::String: return "a string";
+   27|      0|    case Type::Bool: return "a boolean";
+   28|      0|  }
+   29|      0|  return "a value";
+   30|      0|}
+   31|       |
+   32|     29|[[nodiscard]] constexpr auto is_arithmetic(BinaryOp op) noexcept -> bool {
+   33|     29|  return op == BinaryOp::Add || op == BinaryOp::Sub || op == BinaryOp::Mul || op == BinaryOp::Div;
+   34|     29|}
+   35|       |
+   36|      9|[[nodiscard]] constexpr auto is_ordering(BinaryOp op) noexcept -> bool {
+   37|      9|  return op == BinaryOp::Lt || op == BinaryOp::Gt || op == BinaryOp::Le || op == BinaryOp::Ge;
+   38|      9|}
+   39|       |
+   40|       |class TypeChecker {
+   41|       |public:
+   42|       |  TypeChecker(const Ast& ast, const CellIndex& index)
+   43|     22|      : ast_{&ast}, index_{&index}, cell_types_(ast.cells().size()) {}
+   44|       |
+   45|     22|  auto run(std::span<const std::size_t> order) -> std::expected<void, Diagnostic> {
+   46|     79|    for (const auto definition : order) {
+   47|     79|      auto type = infer(ast_->cells()[definition].expression);
+   48|     79|      if (!type) {
+   49|      0|        return std::unexpected(std::move(type).error());
+   50|      0|      }
+   51|     79|      cell_types_[definition] = *type;
+   52|     79|    }
+   53|     22|    return {};
+   54|     22|  }
+   55|       |
+   56|       |private:
+   57|       |  using TypeResult = std::expected<Type, Diagnostic>;
+   58|       |
+   59|      0|  [[nodiscard]] auto error(NodeId node, std::string message) const -> Diagnostic {
+   60|      0|    return Diagnostic{Stage::Types, std::move(message), ast_->location(node)};
+   61|      0|  }
+   62|       |
+   63|     51|  [[nodiscard]] auto type_of_cell(std::size_t definition) const -> Type {
+   64|     51|    return required(cell_types_[definition], "cell read before its type was inferred");
+   65|     51|  }
+   66|       |
+   67|       |  // Requires `node` to have type `wanted`.
+   68|     59|  auto expect(NodeId node, Type wanted, std::string_view context) -> std::expected<void, Diagnostic> {
+   69|     59|    auto type = infer(node);
+   70|     59|    if (!type) {
+   71|      0|      return std::unexpected(std::move(type).error());
+   72|      0|    }
+   73|     59|    if (*type != wanted) {
+   74|      0|      return std::unexpected(
+   75|      0|          error(node, std::format("{} needs {}, not {}", context, describe(wanted), describe(*type))));
+   76|      0|    }
+   77|     59|    return {};
+   78|     59|  }
+   79|       |
+   80|    177|  auto infer(NodeId node) -> TypeResult {
+   81|    177|    const auto& current = ast_->node(node);
+   82|    177|    if (std::holds_alternative<NumberLiteral>(current)) {
+   83|     56|      return Type::Number;
+   84|     56|    }
+   85|    121|    if (std::holds_alternative<StringLiteral>(current)) {
+   86|     21|      return Type::String;
+   87|     21|    }
+   88|    100|    if (std::holds_alternative<BoolLiteral>(current)) {
+   89|      4|      return Type::Bool;
+   90|      4|    }
+   91|     96|    if (const auto* cell = std::get_if<CellReference>(&current)) {
+   92|     37|      return type_of_cell(index_->at(cell->ref));
+   93|     37|    }
+   94|     59|    if (const auto* negate = std::get_if<Negate>(&current)) {
+   95|      5|      if (auto checked = expect(negate->operand, Type::Number, "negation"); !checked) {
+   96|      0|        return std::unexpected(std::move(checked).error());
+   97|      0|      }
+   98|      5|      return Type::Number;
+   99|      5|    }
+  100|     54|    if (const auto* plus = std::get_if<UnaryPlus>(&current)) {
+  101|      0|      if (auto checked = expect(plus->operand, Type::Number, "unary plus"); !checked) {
+  102|      0|        return std::unexpected(std::move(checked).error());
+  103|      0|      }
+  104|      0|      return Type::Number;
+  105|      0|    }
+  106|     54|    if (const auto* binary = std::get_if<Binary>(&current)) {
+  107|     29|      return infer_binary(node, *binary);
+  108|     29|    }
+  109|     25|    if (const auto* call = std::get_if<Call>(&current)) {
+  110|     25|      return infer_call(node, *call);
+  111|     25|    }
+  112|      0|    invariant(false, "range outside a function argument");
+  113|      0|    return Type::Number;
+  114|     25|  }
+  115|       |
+  116|     29|  auto infer_binary(NodeId node, const Binary& binary) -> TypeResult {
+  117|     29|    const auto context = std::format("operator {}", to_string(binary.op));
+  118|     29|    if (is_arithmetic(binary.op)) {
+  119|     17|      if (auto lhs = expect(binary.lhs, Type::Number, context); !lhs) {
+  120|      0|        return std::unexpected(std::move(lhs).error());
+  121|      0|      }
+  122|     17|      if (auto rhs = expect(binary.rhs, Type::Number, context); !rhs) {
+  123|      0|        return std::unexpected(std::move(rhs).error());
+  124|      0|      }
+  125|     17|      return Type::Number;
+  126|     17|    }
+  127|       |
+  128|     12|    auto lhs = infer(binary.lhs);
+  129|     12|    if (!lhs) {
+  130|      0|      return lhs;
+  131|      0|    }
+  132|     12|    auto rhs = infer(binary.rhs);
+  133|     12|    if (!rhs) {
+  134|      0|      return rhs;
+  135|      0|    }
+  136|     12|    if (binary.op == BinaryOp::Concat) {
+  137|      3|      return Type::String;
+  138|      3|    }
+  139|      9|    if (*lhs != *rhs) {
+  140|      0|      return std::unexpected(error(node, std::format("{} cannot compare {} with {}", context,
+  141|      0|                                                     describe(*lhs), describe(*rhs))));
+  142|      0|    }
+  143|      9|    if (is_ordering(binary.op) && *lhs == Type::Bool) {
+  144|      0|      return std::unexpected(error(node, std::format("{} cannot order booleans", context)));
+  145|      0|    }
+  146|      9|    return Type::Bool;
+  147|      9|  }
+  148|       |
+  149|       |  // Every defined cell in the range must hold a number.
+  150|       |  auto expect_numeric_range(NodeId node, const RangeReference& range, std::string_view context)
+  151|      8|      -> std::expected<void, Diagnostic> {
+  152|      8|    const CellRange cells{range.first, range.last};
+  153|     14|    for (const auto covered : covered_definitions(*ast_, cells)) {
+  154|     14|      if (const auto type = type_of_cell(covered); type != Type::Number) {
+  155|      0|        return std::unexpected(error(
+  156|      0|            node, std::format("{} needs numbers, but cell {} holds {}", context,
+  157|      0|                              to_string(ast_->cells()[covered].target), describe(type))));
+  158|      0|      }
+  159|     14|    }
+  160|      8|    return {};
+  161|      8|  }
+  162|       |
+  163|     25|  auto infer_call(NodeId node, const Call& call) -> TypeResult {
+  164|     25|    const auto spec = required(find_function(call.name), "unknown function after resolution");
+  165|     25|    const auto& arguments = call.arguments;
+  166|       |
+  167|     25|    if (!spec.accepts_ranges) {
+  168|     23|      for (const auto argument : arguments) {
+  169|     23|        if (std::holds_alternative<RangeReference>(ast_->node(argument))) {
+  170|      0|          return std::unexpected(
+  171|      0|              error(argument, std::format("{} does not accept a range", spec.name)));
+  172|      0|        }
+  173|     23|      }
+  174|     11|    }
+  175|       |
+  176|     25|    switch (spec.id) {
+  177|      3|      case Function::Sum:
+  178|      5|      case Function::Min:
+  179|      7|      case Function::Max:
+  180|      9|      case Function::Average:
+  181|     13|        for (const auto argument : arguments) {
+  182|     13|          const auto* range = std::get_if<RangeReference>(&ast_->node(argument));
+  183|     13|          auto checked = range != nullptr ? expect_numeric_range(argument, *range, spec.name)
+  184|     13|                                          : expect(argument, Type::Number, spec.name);
+  185|     13|          if (!checked) {
+  186|      0|            return std::unexpected(std::move(checked).error());
+  187|      0|          }
+  188|     13|        }
+  189|      9|        return Type::Number;
+  190|       |
+  191|      3|      case Function::Count:
+  192|      5|      case Function::Concat:
+  193|       |        // Any values; ranges may hold anything.
+  194|      9|        for (const auto argument : arguments) {
+  195|      9|          if (std::holds_alternative<RangeReference>(ast_->node(argument))) {
+  196|      2|            continue;
+  197|      2|          }
+  198|      7|          if (auto type = infer(argument); !type) {
+  199|      0|            return type;
+  200|      0|          }
+  201|      7|        }
+  202|      5|        return spec.id == Function::Count ? Type::Number : Type::String;
+  203|       |
+  204|      4|      case Function::If: {
+  205|      4|        if (auto condition = expect(arguments[0], Type::Bool, "IF condition"); !condition) {
+  206|      0|          return std::unexpected(std::move(condition).error());
+  207|      0|        }
+  208|      4|        auto then_type = infer(arguments[1]);
+  209|      4|        if (!then_type) {
+  210|      0|          return then_type;
+  211|      0|        }
+  212|      4|        auto else_type = infer(arguments[2]);
+  213|      4|        if (!else_type) {
+  214|      0|          return else_type;
+  215|      0|        }
+  216|      4|        if (*then_type != *else_type) {
+  217|      0|          return std::unexpected(error(node, std::format("IF branches differ: {} and {}",
+  218|      0|                                                         describe(*then_type),
+  219|      0|                                                         describe(*else_type))));
+  220|      0|        }
+  221|      4|        return *then_type;
+  222|      4|      }
+  223|       |
+  224|      3|      case Function::Len:
+  225|      3|        if (auto text = expect(arguments[0], Type::String, "LEN"); !text) {
+  226|      0|          return std::unexpected(std::move(text).error());
+  227|      0|        }
+  228|      3|        return Type::Number;
+  229|       |
+  230|      4|      case Function::Round:
+  231|      8|        for (const auto argument : arguments) {
+  232|      8|          if (auto number = expect(argument, Type::Number, "ROUND"); !number) {
+  233|      0|            return std::unexpected(std::move(number).error());
+  234|      0|          }
+  235|      8|        }
+  236|      4|        return Type::Number;
+  237|     25|    }
+  238|      0|    invariant(false, "unhandled function");
+  239|      0|    return Type::Number;
+  240|     25|  }
+  241|       |
+  242|       |  const Ast* ast_;
+  243|       |  const CellIndex* index_;
+  244|       |  std::vector<std::optional<Type>> cell_types_;  // by definition index
+  245|       |};
+  246|       |
+  247|       |}  // namespace
+  248|       |
+  249|       |auto check_types(const Ast& ast, const CellIndex& index, std::span<const std::size_t> order)
+  250|     22|    -> std::expected<void, Diagnostic> {
+  251|     22|  return TypeChecker{ast, index}.run(order);
+  252|     22|}
+  253|       |
+  254|       |}  // namespace sheet::detail
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/analysis.hpp:
+    1|       |#pragma once
+    2|       |
+    3|       |// Internal: the stages behind sheet::check, and helpers shared with the
+    4|       |// evaluator.
+    5|       |
+    6|       |#include <cstddef>
+    7|       |#include <expected>
+    8|       |#include <span>
+    9|       |#include <unordered_map>
+   10|       |#include <variant>
+   11|       |#include <vector>
+   12|       |
+   13|       |#include "sheet/ast.hpp"
+   14|       |#include "sheet/types.hpp"
+   15|       |
+   16|       |namespace sheet::detail {
+   17|       |
+   18|       |using CellIndex = std::unordered_map<CellRef, std::size_t, CellRefHash>;
+   19|       |
+   20|       |// A rectangle of cells with first at the top left and last at the bottom
+   21|       |// right. Build one with normalized(); a range may be written either way
+   22|       |// round (B3:B1 means B1:B3).
+   23|       |struct CellRange {
+   24|       |  CellRef first;
+   25|       |  CellRef last;
+   26|       |};
+   27|       |
+   28|       |[[nodiscard]] auto normalized(CellRef a, CellRef b) noexcept -> CellRange;
+   29|       |[[nodiscard]] auto contains(const CellRange& range, CellRef ref) noexcept -> bool;
+   30|       |
+   31|       |// Indices of the defined cells inside `range`, in row-major order (row by
+   32|       |// row, left to right). Undefined cells in a range are simply empty.
+   33|       |[[nodiscard]] auto covered_definitions(const Ast& ast, const CellRange& range)
+   34|       |    -> std::vector<std::size_t>;
+   35|       |
+   36|       |// Calls on_cell(CellRef) for every direct reference and on_range(CellRange)
+   37|       |// for every range in the expression rooted at `node`.
+   38|       |template <typename OnCell, typename OnRange>
+   39|    374|auto for_each_reference(const Ast& ast, NodeId node, OnCell& on_cell, OnRange& on_range) -> void {
+   40|    374|  const auto& current = ast.node(node);
+   41|    374|  if (const auto* cell = std::get_if<CellReference>(&current)) {
+   42|     74|    on_cell(cell->ref);
+   43|    300|  } else if (const auto* range = std::get_if<RangeReference>(&current)) {
+   44|     20|    on_range(normalized(range->first, range->last));
+   45|    280|  } else if (const auto* negate = std::get_if<Negate>(&current)) {
+   46|     10|    for_each_reference(ast, negate->operand, on_cell, on_range);
+   47|    270|  } else if (const auto* plus = std::get_if<UnaryPlus>(&current)) {
+   48|      0|    for_each_reference(ast, plus->operand, on_cell, on_range);
+   49|    270|  } else if (const auto* binary = std::get_if<Binary>(&current)) {
+   50|     58|    for_each_reference(ast, binary->lhs, on_cell, on_range);
+   51|     58|    for_each_reference(ast, binary->rhs, on_cell, on_range);
+   52|    212|  } else if (const auto* call = std::get_if<Call>(&current)) {
+   53|     90|    for (const auto argument : call->arguments) {
+   54|     90|      for_each_reference(ast, argument, on_cell, on_range);
+   55|     90|    }
+   56|     50|  }
+   57|    374|}
+  ------------------
+  | dependencies.cpp:_ZN5sheet6detail18for_each_referenceIZNKS0_12_GLOBAL__N_115DependencyGraph5readsEmEUlNS_7CellRefEE_ZNKS3_5readsEmEUlRKNS0_9CellRangeEE_EEvRKNS_3AstENS_6NodeIdERT_RT0_:
+  |   39|    187|auto for_each_reference(const Ast& ast, NodeId node, OnCell& on_cell, OnRange& on_range) -> void {
+  |   40|    187|  const auto& current = ast.node(node);
+  |   41|    187|  if (const auto* cell = std::get_if<CellReference>(&current)) {
+  |   42|     37|    on_cell(cell->ref);
+  |   43|    150|  } else if (const auto* range = std::get_if<RangeReference>(&current)) {
+  |   44|     10|    on_range(normalized(range->first, range->last));
+  |   45|    140|  } else if (const auto* negate = std::get_if<Negate>(&current)) {
+  |   46|      5|    for_each_reference(ast, negate->operand, on_cell, on_range);
+  |   47|    135|  } else if (const auto* plus = std::get_if<UnaryPlus>(&current)) {
+  |   48|      0|    for_each_reference(ast, plus->operand, on_cell, on_range);
+  |   49|    135|  } else if (const auto* binary = std::get_if<Binary>(&current)) {
+  |   50|     29|    for_each_reference(ast, binary->lhs, on_cell, on_range);
+  |   51|     29|    for_each_reference(ast, binary->rhs, on_cell, on_range);
+  |   52|    106|  } else if (const auto* call = std::get_if<Call>(&current)) {
+  |   53|     45|    for (const auto argument : call->arguments) {
+  |   54|     45|      for_each_reference(ast, argument, on_cell, on_range);
+  |   55|     45|    }
+  |   56|     25|  }
+  |   57|    187|}
+  ------------------
+  | evaluate.cpp:_ZN5sheet6detail18for_each_referenceIZNKS_12_GLOBAL__N_19Evaluator5readyEmEUlNS_7CellRefEE_ZNKS3_5readyEmEUlRKNS0_9CellRangeEE_EEvRKNS_3AstENS_6NodeIdERT_RT0_:
+  |   39|    187|auto for_each_reference(const Ast& ast, NodeId node, OnCell& on_cell, OnRange& on_range) -> void {
+  |   40|    187|  const auto& current = ast.node(node);
+  |   41|    187|  if (const auto* cell = std::get_if<CellReference>(&current)) {
+  |   42|     37|    on_cell(cell->ref);
+  |   43|    150|  } else if (const auto* range = std::get_if<RangeReference>(&current)) {
+  |   44|     10|    on_range(normalized(range->first, range->last));
+  |   45|    140|  } else if (const auto* negate = std::get_if<Negate>(&current)) {
+  |   46|      5|    for_each_reference(ast, negate->operand, on_cell, on_range);
+  |   47|    135|  } else if (const auto* plus = std::get_if<UnaryPlus>(&current)) {
+  |   48|      0|    for_each_reference(ast, plus->operand, on_cell, on_range);
+  |   49|    135|  } else if (const auto* binary = std::get_if<Binary>(&current)) {
+  |   50|     29|    for_each_reference(ast, binary->lhs, on_cell, on_range);
+  |   51|     29|    for_each_reference(ast, binary->rhs, on_cell, on_range);
+  |   52|    106|  } else if (const auto* call = std::get_if<Call>(&current)) {
+  |   53|     45|    for (const auto argument : call->arguments) {
+  |   54|     45|      for_each_reference(ast, argument, on_cell, on_range);
+  |   55|     45|    }
+  |   56|     25|  }
+  |   57|    187|}
+  ------------------
+   58|       |
+   59|       |// Stage Resolve: unique definitions, defined references, known functions.
+   60|       |[[nodiscard]] auto resolve(const Ast& ast) -> std::expected<CellIndex, Diagnostic>;
+   61|       |
+   62|       |// Stage Dependencies: rejects cycles; returns definition indices in an order
+   63|       |// where every cell comes after the cells it reads.
+   64|       |[[nodiscard]] auto order_cells(const Ast& ast, const CellIndex& index)
+   65|       |    -> std::expected<std::vector<std::size_t>, Diagnostic>;
+   66|       |
+   67|       |// Stage Types: static types of every expression.
+   68|       |[[nodiscard]] auto check_types(const Ast& ast, const CellIndex& index,
+   69|       |                               std::span<const std::size_t> order)
+   70|       |    -> std::expected<void, Diagnostic>;
+   71|       |
+   72|       |}  // namespace sheet::detail
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/evaluate.cpp:
+    1|       |// sheet::evaluate: computes every cell of a checked sheet.
+    2|       |//
+    3|       |// Cells are taken from a worklist seeded with check()'s evaluation order. A
+    4|       |// cell whose inputs are not ready yet goes to the back of the list; with a
+    5|       |// correct order that never happens, but it keeps evaluation independent of
+    6|       |// how the order was produced.
+    7|       |//
+    8|       |// Spreadsheet errors (#DIV/0, #NUM, ...) are values: an operation on an error
+    9|       |// produces that error, so errors propagate to every dependent cell.
+   10|       |
+   11|       |#include <algorithm>
+   12|       |#include <cmath>
+   13|       |#include <compare>
+   14|       |#include <cstddef>
+   15|       |#include <deque>
+   16|       |#include <format>
+   17|       |#include <limits>
+   18|       |#include <optional>
+   19|       |#include <string>
+   20|       |#include <string_view>
+   21|       |#include <utility>
+   22|       |#include <variant>
+   23|       |#include <vector>
+   24|       |
+   25|       |#include "analysis.hpp"
+   26|       |#include "functions.hpp"
+   27|       |#include "invariant.hpp"
+   28|       |#include "sheet/sheet.hpp"
+   29|       |
+   30|       |namespace sheet {
+   31|       |namespace {
+   32|       |
+   33|       |using detail::Function;
+   34|       |using detail::invariant;
+   35|       |
+   36|       |inline constexpr int max_round_digits = 15;
+   37|       |
+   38|     95|[[nodiscard]] auto error_of(const Value& value) -> std::optional<ErrorValue> {
+   39|     95|  if (const auto* error = std::get_if<ErrorValue>(&value)) {
+   40|      2|    return *error;
+   41|      2|  }
+   42|     93|  return std::nullopt;
+   43|     95|}
+   44|       |
+   45|     21|[[nodiscard]] auto number_or_error(double number) -> Value {
+   46|     21|  if (!std::isfinite(number)) {
+   47|      1|    return ErrorValue{ErrorKind::Num};
+   48|      1|  }
+   49|     20|  return number;
+   50|     21|}
+   51|       |
+   52|       |// The text a value contributes to & and CONCAT. Not used for errors.
+   53|      6|[[nodiscard]] auto text_of(const Value& value) -> std::string {
+   54|      6|  if (const auto* text = std::get_if<std::string>(&value)) {
+   55|      3|    return *text;
+   56|      3|  }
+   57|      3|  if (const auto* flag = std::get_if<bool>(&value)) {
+   58|      1|    return *flag ? "TRUE" : "FALSE";
+   59|      1|  }
+   60|      2|  return std::format("{}", std::get<double>(value));
+   61|      3|}
+   62|       |
+   63|       |class Evaluator {
+   64|       |public:
+   65|       |  explicit Evaluator(const CheckedSheet& sheet)
+   66|     22|      : sheet_{&sheet}, ast_{&sheet.ast()}, values_(sheet.ast().cells().size()) {}
+   67|       |
+   68|     22|  auto run() -> Values {
+   69|     22|    const auto& order = sheet_->evaluation_order();
+   70|     22|    std::deque<std::size_t> pending{order.begin(), order.end()};
+   71|    101|    while (!pending.empty()) {
+   72|     79|      const auto definition = pending.front();
+   73|     79|      pending.pop_front();
+   74|     79|      if (!ready(definition)) {
+   75|      0|        pending.push_back(definition);
+   76|      0|        continue;
+   77|      0|      }
+   78|     79|      values_[definition] = evaluate(ast_->cells()[definition].expression);
+   79|     79|    }
+   80|       |
+   81|     22|    std::map<CellRef, Value> results;
+   82|     22|    const auto cells = ast_->cells();
+   83|    101|    for (std::size_t i = 0; i < cells.size(); ++i) {
+   84|     79|      results.emplace(cells[i].target, detail::required(std::move(values_[i]), "cell left unevaluated"));
+   85|     79|    }
+   86|     22|    return Values{std::move(results)};
+   87|     22|  }
+   88|       |
+   89|       |private:
+   90|       |  // True when every cell that `definition` reads has a value.
+   91|     79|  [[nodiscard]] auto ready(std::size_t definition) const -> bool {
+   92|     79|    bool all_ready = true;
+   93|     79|    auto on_cell = [&](CellRef ref) { all_ready = all_ready && has_value(ref); };
+   94|     79|    auto on_range = [&](const detail::CellRange& range) {
+   95|     19|      for (const auto covered : detail::covered_definitions(*ast_, range)) {
+   96|     19|        all_ready = all_ready && values_[covered].has_value();
+   97|     19|      }
+   98|     10|    };
+   99|     79|    detail::for_each_reference(*ast_, ast_->cells()[definition].expression, on_cell, on_range);
+  100|     79|    return all_ready;
+  101|     79|  }
+  102|       |
+  103|     37|  [[nodiscard]] auto has_value(CellRef ref) const -> bool {
+  104|     37|    const auto definition = sheet_->definition_of(ref);
+  105|     37|    return definition && values_[*definition].has_value();
+  106|     37|  }
+  107|       |
+  108|     56|  [[nodiscard]] auto read(std::size_t definition) const -> const Value& {
+  109|     56|    return detail::required(values_[definition], "cell read before it was evaluated");
+  110|     56|  }
+  111|       |
+  112|     37|  [[nodiscard]] auto read(CellRef ref) const -> const Value& {
+  113|     37|    return read(detail::required(sheet_->definition_of(ref),
+  114|     37|                                 "reference to an undefined cell after resolution"));
+  115|     37|  }
+  116|       |
+  117|     62|  [[nodiscard]] static auto number(const Value& value) -> double {
+  118|     62|    const auto* result = std::get_if<double>(&value);
+  119|     62|    invariant(result != nullptr, "type checker guaranteed a number");
+  120|     62|    return *result;
+  121|     62|  }
+  122|       |
+  123|     18|  [[nodiscard]] auto range_of(NodeId node) const -> const RangeReference* {
+  124|     18|    return std::get_if<RangeReference>(&ast_->node(node));
+  125|     18|  }
+  126|       |
+  127|     10|  [[nodiscard]] auto covered(const RangeReference& range) const -> std::vector<std::size_t> {
+  128|     10|    return detail::covered_definitions(*ast_, detail::normalized(range.first, range.last));
+  129|     10|  }
+  130|       |
+  131|    167|  auto evaluate(NodeId node) -> Value {
+  132|    167|    const auto& current = ast_->node(node);
+  133|    167|    if (const auto* literal = std::get_if<NumberLiteral>(&current)) {
+  134|     53|      return literal->value;
+  135|     53|    }
+  136|    114|    if (const auto* literal = std::get_if<StringLiteral>(&current)) {
+  137|     14|      return literal->value;
+  138|     14|    }
+  139|    100|    if (const auto* literal = std::get_if<BoolLiteral>(&current)) {
+  140|      4|      return literal->value;
+  141|      4|    }
+  142|     96|    if (const auto* cell = std::get_if<CellReference>(&current)) {
+  143|     37|      return read(cell->ref);
+  144|     37|    }
+  145|     59|    if (const auto* negate = std::get_if<Negate>(&current)) {
+  146|      5|      const auto operand = evaluate(negate->operand);
+  147|      5|      if (const auto error = error_of(operand)) {
+  148|      0|        return *error;
+  149|      0|      }
+  150|      5|      return -number(operand);
+  151|      5|    }
+  152|     54|    if (const auto* plus = std::get_if<UnaryPlus>(&current)) {
+  153|      0|      return evaluate(plus->operand);
+  154|      0|    }
+  155|     54|    if (const auto* binary = std::get_if<Binary>(&current)) {
+  156|     29|      return evaluate_binary(*binary);
+  157|     29|    }
+  158|     25|    if (const auto* call = std::get_if<Call>(&current)) {
+  159|     25|      return evaluate_call(*call);
+  160|     25|    }
+  161|      0|    invariant(false, "range outside a function argument");
+  162|      0|    return ErrorValue{ErrorKind::Value};
+  163|     25|  }
+  164|       |
+  165|     29|  auto evaluate_binary(const Binary& binary) -> Value {
+  166|     29|    const auto lhs = evaluate(binary.lhs);
+  167|     29|    if (const auto error = error_of(lhs)) {
+  168|      2|      return *error;
+  169|      2|    }
+  170|     27|    const auto rhs = evaluate(binary.rhs);
+  171|     27|    if (const auto error = error_of(rhs)) {
+  172|      0|      return *error;
+  173|      0|    }
+  174|       |
+  175|     27|    switch (binary.op) {
+  176|      2|      case BinaryOp::Add: return number_or_error(number(lhs) + number(rhs));
+  177|      4|      case BinaryOp::Sub: return number_or_error(number(lhs) - number(rhs));
+  178|      6|      case BinaryOp::Mul: return number_or_error(number(lhs) * number(rhs));
+  179|      3|      case BinaryOp::Div:
+  180|      3|        if (number(rhs) == 0.0) {
+  181|      1|          return ErrorValue{ErrorKind::DivZero};
+  182|      1|        }
+  183|      2|        return number_or_error(number(lhs) / number(rhs));
+  184|      3|      case BinaryOp::Concat: return text_of(lhs) + text_of(rhs);
+  185|      3|      case BinaryOp::Eq: return lhs == rhs;
+  186|      1|      case BinaryOp::Ne: return lhs != rhs;
+  187|      1|      case BinaryOp::Lt: return compare(lhs, rhs) < 0;
+  188|      2|      case BinaryOp::Gt: return compare(lhs, rhs) > 0;
+  189|      0|      case BinaryOp::Le: return compare(lhs, rhs) <= 0;
+  190|      2|      case BinaryOp::Ge: return compare(lhs, rhs) >= 0;
+  191|     27|    }
+  192|      0|    invariant(false, "unhandled operator");
+  193|      0|    return ErrorValue{ErrorKind::Value};
+  194|     27|  }
+  195|       |
+  196|       |  // The type checker guarantees two numbers or two strings.
+  197|      5|  [[nodiscard]] static auto compare(const Value& lhs, const Value& rhs) -> std::partial_ordering {
+  198|      5|    const auto* left_number = std::get_if<double>(&lhs);
+  199|      5|    const auto* right_number = std::get_if<double>(&rhs);
+  200|      5|    if (left_number != nullptr && right_number != nullptr) {
+  201|      4|      return *left_number <=> *right_number;
+  202|      4|    }
+  203|      1|    const auto* left_text = std::get_if<std::string>(&lhs);
+  204|      1|    const auto* right_text = std::get_if<std::string>(&rhs);
+  205|      1|    invariant(left_text != nullptr && right_text != nullptr,
+  206|      1|              "type checker guaranteed two numbers or two strings");
+  207|      1|    return *left_text <=> *right_text;
+  208|      5|  }
+  209|       |
+  210|       |  // The numbers in the arguments of SUM, MIN, MAX and AVERAGE, or the first
+  211|       |  // error among them.
+  212|      9|  auto collect_numbers(const Call& call) -> std::variant<std::vector<double>, ErrorValue> {
+  213|      9|    std::vector<double> numbers;
+  214|     13|    for (const auto argument : call.arguments) {
+  215|     13|      if (const auto* range = range_of(argument)) {
+  216|     14|        for (const auto definition : covered(*range)) {
+  217|     14|          const auto& value = read(definition);
+  218|     14|          if (const auto error = error_of(value)) {
+  219|      0|            return *error;
+  220|      0|          }
+  221|     14|          numbers.push_back(number(value));
+  222|     14|        }
+  223|      8|        continue;
+  224|      8|      }
+  225|      5|      const auto value = evaluate(argument);
+  226|      5|      if (const auto error = error_of(value)) {
+  227|      0|        return *error;
+  228|      0|      }
+  229|      5|      numbers.push_back(number(value));
+  230|      5|    }
+  231|      9|    return numbers;
+  232|      9|  }
+  233|       |
+  234|      3|  auto count(const Call& call) -> Value {
+  235|      3|    double count = 0;
+  236|      8|    const auto add = [&](const Value& value) {
+  237|      8|      if (std::holds_alternative<double>(value)) {
+  238|      5|        ++count;
+  239|      5|      }
+  240|      8|    };
+  241|      5|    for (const auto argument : call.arguments) {
+  242|      5|      if (const auto* range = range_of(argument)) {
+  243|      5|        for (const auto definition : covered(*range)) {
+  244|      5|          add(read(definition));
+  245|      5|        }
+  246|      3|      } else {
+  247|      3|        add(evaluate(argument));
+  248|      3|      }
+  249|      5|    }
+  250|      3|    return count;
+  251|      3|  }
+  252|       |
+  253|       |  // Text that is already stored (string literals in the Ast, string values
+  254|       |  // of cells) is viewed in place. Other text is converted into `owned`, a
+  255|       |  // deque, so earlier strings never move while pieces refer to them.
+  256|      2|  auto concat(const Call& call) -> Value {
+  257|      2|    std::vector<std::string_view> pieces;
+  258|      2|    std::deque<std::string> owned;
+  259|      4|    for (const auto argument : call.arguments) {
+  260|      4|      if (const auto* literal = std::get_if<StringLiteral>(&ast_->node(argument))) {
+  261|      4|        pieces.emplace_back(literal->value);
+  262|      4|      } else if (const auto* range = range_of(argument)) {
+  263|      0|        for (const auto definition : covered(*range)) {
+  264|      0|          const auto& value = read(definition);
+  265|      0|          if (const auto error = error_of(value)) {
+  266|      0|            return *error;
+  267|      0|          }
+  268|      0|          if (const auto* text = std::get_if<std::string>(&value)) {
+  269|      0|            pieces.emplace_back(*text);
+  270|      0|          } else {
+  271|      0|            pieces.emplace_back(text_of(value));
+  272|      0|          }
+  273|      0|        }
+  274|      0|      } else {
+  275|      0|        const auto value = evaluate(argument);
+  276|      0|        if (const auto error = error_of(value)) {
+  277|      0|          return *error;
+  278|      0|        }
+  279|      0|        pieces.emplace_back(owned.emplace_back(text_of(value)));
+  280|      0|      }
+  281|      4|    }
+  282|       |
+  283|      2|    std::size_t length = 0;
+  284|      4|    for (const auto piece : pieces) {
+  285|      4|      length += piece.size();
+  286|      4|    }
+  287|      2|    std::string result;
+  288|      2|    result.reserve(length);
+  289|      4|    for (const auto piece : pieces) {
+  290|      4|      result.append(piece);
+  291|      4|    }
+  292|      2|    return result;
+  293|      2|  }
+  294|       |
+  295|      4|  auto round(const Call& call) -> Value {
+  296|      4|    const auto value = evaluate(call.arguments[0]);
+  297|      4|    if (const auto error = error_of(value)) {
+  298|      0|      return *error;
+  299|      0|    }
+  300|      4|    const auto digits_value = evaluate(call.arguments[1]);
+  301|      4|    if (const auto error = error_of(digits_value)) {
+  302|      0|      return *error;
+  303|      0|    }
+  304|      4|    const double digits = number(digits_value);
+  305|      4|    if (digits != std::trunc(digits) || std::abs(digits) > max_round_digits) {
+  306|      1|      return ErrorValue{ErrorKind::Num};
+  307|      1|    }
+  308|      3|    const double scale = std::pow(10.0, digits);
+  309|      3|    return number_or_error(std::round(number(value) * scale) / scale);
+  310|      4|  }
+  311|       |
+  312|     25|  auto evaluate_call(const Call& call) -> Value {
+  313|     25|    const auto spec =
+  314|     25|        detail::required(detail::find_function(call.name), "unknown function after resolution");
+  315|       |
+  316|     25|    switch (spec.id) {
+  317|      3|      case Function::Sum:
+  318|      5|      case Function::Min:
+  319|      7|      case Function::Max:
+  320|      9|      case Function::Average: {
+  321|      9|        auto collected = collect_numbers(call);
+  322|      9|        if (const auto* error = std::get_if<ErrorValue>(&collected)) {
+  323|      0|          return *error;
+  324|      0|        }
+  325|      9|        const auto& numbers = std::get<std::vector<double>>(collected);
+  326|      9|        if (spec.id == Function::Min || spec.id == Function::Max) {
+  327|      4|          if (numbers.empty()) {
+  328|      1|            return 0.0;  // as in common spreadsheet applications
+  329|      1|          }
+  330|      3|          return spec.id == Function::Min ? std::ranges::min(numbers) : std::ranges::max(numbers);
+  331|      4|        }
+  332|      5|        double sum = 0.0;
+  333|     12|        for (const auto n : numbers) {
+  334|     12|          sum += n;
+  335|     12|        }
+  336|      5|        if (spec.id == Function::Sum) {
+  337|      3|          return number_or_error(sum);
+  338|      3|        }
+  339|      2|        if (numbers.empty()) {
+  340|      1|          return ErrorValue{ErrorKind::DivZero};
+  341|      1|        }
+  342|      1|        return number_or_error(sum / static_cast<double>(numbers.size()));
+  343|      2|      }
+  344|      3|      case Function::Count: return count(call);
+  345|      4|      case Function::If: {
+  346|      4|        const auto condition = evaluate(call.arguments[0]);
+  347|      4|        if (const auto error = error_of(condition)) {
+  348|      0|          return *error;
+  349|      0|        }
+  350|      4|        const auto* flag = std::get_if<bool>(&condition);
+  351|      4|        invariant(flag != nullptr, "type checker guaranteed a boolean condition");
+  352|      4|        return evaluate(call.arguments[*flag ? 1 : 2]);
+  353|      4|      }
+  354|      2|      case Function::Concat: return concat(call);
+  355|      3|      case Function::Len: {
+  356|      3|        const auto text = evaluate(call.arguments[0]);
+  357|      3|        if (const auto error = error_of(text)) {
+  358|      0|          return *error;
+  359|      0|        }
+  360|      3|        const auto* string = std::get_if<std::string>(&text);
+  361|      3|        invariant(string != nullptr, "type checker guaranteed a string");
+  362|      3|        return static_cast<double>(string->size());
+  363|      3|      }
+  364|      4|      case Function::Round: return round(call);
+  365|     25|    }
+  366|      0|    invariant(false, "unhandled function");
+  367|      0|    return ErrorValue{ErrorKind::Value};
+  368|     25|  }
+  369|       |
+  370|       |  const CheckedSheet* sheet_;
+  371|       |  const Ast* ast_;
+  372|       |  std::vector<std::optional<Value>> values_;  // by definition index
+  373|       |};
+  374|       |
+  375|       |}  // namespace
+  376|       |
+  377|     22|Values::Values(std::map<CellRef, Value> values) : values_{std::move(values)} {}
+  378|       |
+  379|      0|auto Values::at(CellRef ref) const -> std::optional<Value> {
+  380|      0|  if (const auto found = values_.find(ref); found != values_.end()) {
+  381|      0|    return found->second;
+  382|      0|  }
+  383|      0|  return std::nullopt;
+  384|      0|}
+  385|       |
+  386|     22|auto evaluate(const CheckedSheet& sheet) -> std::expected<Values, Diagnostic> {
+  387|     22|  return Evaluator{sheet}.run();
+  388|     22|}
+  389|       |
+  390|       |}  // namespace sheet
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/check.cpp:
+    1|       |// sheet::check: name resolution, dependency analysis and type checking.
+    2|       |
+    3|       |#include <utility>
+    4|       |
+    5|       |#include "analysis.hpp"
+    6|       |#include "sheet/sheet.hpp"
+    7|       |
+    8|       |namespace sheet {
+    9|       |
+   10|       |CheckedSheet::CheckedSheet(Ast ast, std::vector<std::size_t> evaluation_order)
+   11|     22|    : ast_{std::move(ast)}, evaluation_order_{std::move(evaluation_order)} {
+   12|     22|  const auto cells = ast_.cells();
+   13|     22|  definitions_.reserve(cells.size());
+   14|    101|  for (std::size_t i = 0; i < cells.size(); ++i) {
+   15|     79|    definitions_.emplace(cells[i].target, i);
+   16|     79|  }
+   17|     22|}
+   18|       |
+   19|     74|auto CheckedSheet::definition_of(CellRef ref) const -> std::optional<std::size_t> {
+   20|     74|  if (const auto found = definitions_.find(ref); found != definitions_.end()) {
+   21|     74|    return found->second;
+   22|     74|  }
+   23|      0|  return std::nullopt;
+   24|     74|}
+   25|       |
+   26|     23|auto check(Ast ast) -> std::expected<CheckedSheet, Diagnostic> {
+   27|     23|  auto index = detail::resolve(ast);
+   28|     23|  if (!index) {
+   29|      1|    return std::unexpected(std::move(index).error());
+   30|      1|  }
+   31|     22|  auto order = detail::order_cells(ast, *index);
+   32|     22|  if (!order) {
+   33|      0|    return std::unexpected(std::move(order).error());
+   34|      0|  }
+   35|     22|  if (auto typed = detail::check_types(ast, *index, *order); !typed) {
+   36|      0|    return std::unexpected(std::move(typed).error());
+   37|      0|  }
+   38|     22|  return CheckedSheet{std::move(ast), std::move(*order)};
+   39|     22|}
+   40|       |
+   41|       |}  // namespace sheet
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/ast.cpp:
+    1|       |#include "sheet/ast.hpp"
+    2|       |
+    3|       |#include <limits>
+    4|       |#include <stdexcept>
+    5|       |#include <utility>
+    6|       |
+    7|       |namespace sheet {
+    8|       |
+    9|     29|auto to_string(BinaryOp op) -> std::string_view {
+   10|     29|  switch (op) {
+   11|      3|    case BinaryOp::Add: return "+";
+   12|      5|    case BinaryOp::Sub: return "-";
+   13|      6|    case BinaryOp::Mul: return "*";
+   14|      3|    case BinaryOp::Div: return "/";
+   15|      3|    case BinaryOp::Concat: return "&";
+   16|      3|    case BinaryOp::Eq: return "==";
+   17|      1|    case BinaryOp::Ne: return "<>";
+   18|      1|    case BinaryOp::Lt: return "<";
+   19|      2|    case BinaryOp::Gt: return ">";
+   20|      0|    case BinaryOp::Le: return "<=";
+   21|      2|    case BinaryOp::Ge: return ">=";
+   22|     29|  }
+   23|      0|  return "?";
+   24|     29|}
+   25|       |
+   26|     44|Ast::Ast(std::string source) : source_{std::make_unique<const std::string>(std::move(source))} {}
+   27|       |
+   28|    230|auto Ast::add(Node node, SourceLocation location) -> NodeId {
+   29|    230|  if (nodes_.size() >= std::numeric_limits<std::uint32_t>::max()) {
+   30|      0|    throw std::length_error{"too many AST nodes"};
+   31|      0|  }
+   32|    230|  const NodeId id{static_cast<std::uint32_t>(nodes_.size())};
+   33|    230|  nodes_.push_back(std::move(node));
+   34|    230|  locations_.push_back(location);
+   35|    230|  return id;
+   36|    230|}
+   37|       |
+   38|    101|auto Ast::add_cell(CellDefinition definition) -> void { cells_.push_back(definition); }
+   39|       |
+   40|    976|auto Ast::node(NodeId id) const -> const Node& { return nodes_[id.value]; }
+   41|       |
+   42|     26|auto Ast::location(NodeId id) const -> SourceLocation { return locations_[id.value]; }
+   43|       |
+   44|       |}  // namespace sheet
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/functions.hpp:
+    1|       |#pragma once
+    2|       |
+    3|       |// The built-in functions. Resolution checks names and arity against this
+    4|       |// table; the type checker and evaluator dispatch on Function.
+    5|       |
+    6|       |#include <algorithm>
+    7|       |#include <array>
+    8|       |#include <cstddef>
+    9|       |#include <cstdint>
+   10|       |#include <optional>
+   11|       |#include <string_view>
+   12|       |
+   13|       |namespace sheet::detail {
+   14|       |
+   15|       |enum class Function : std::uint8_t { Sum, Min, Max, Average, Count, If, Concat, Len, Round };
+   16|       |
+   17|       |struct FunctionSpec {
+   18|       |  Function id;
+   19|       |  std::string_view name;
+   20|       |  std::size_t min_arity;
+   21|       |  std::size_t max_arity;
+   22|       |  bool accepts_ranges;
+   23|       |};
+   24|       |
+   25|       |inline constexpr std::size_t max_arguments = 255;
+   26|       |
+   27|       |inline constexpr auto functions = std::array{
+   28|       |    FunctionSpec{Function::Sum, "SUM", 1, max_arguments, true},
+   29|       |    FunctionSpec{Function::Min, "MIN", 1, max_arguments, true},
+   30|       |    FunctionSpec{Function::Max, "MAX", 1, max_arguments, true},
+   31|       |    FunctionSpec{Function::Average, "AVERAGE", 1, max_arguments, true},
+   32|       |    FunctionSpec{Function::Count, "COUNT", 1, max_arguments, true},
+   33|       |    FunctionSpec{Function::If, "IF", 3, 3, false},
+   34|       |    FunctionSpec{Function::Concat, "CONCAT", 1, max_arguments, true},
+   35|       |    FunctionSpec{Function::Len, "LEN", 1, 1, false},
+   36|       |    FunctionSpec{Function::Round, "ROUND", 2, 2, false},
+   37|       |};
+   38|       |
+   39|     75|[[nodiscard]] constexpr auto find_function(std::string_view name) -> std::optional<FunctionSpec> {
+   40|     75|  const auto* found = std::ranges::find(functions, name, &FunctionSpec::name);
+   41|     75|  if (found == functions.end()) {
+   42|      0|    return std::nullopt;
+   43|      0|  }
+   44|     75|  return *found;
+   45|     75|}
+   46|       |
+   47|       |}  // namespace sheet::detail
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/parser.cpp:
+    1|       |// Header check, lexing and recursive-descent parsing: sheet::parse.
+    2|       |
+    3|       |#include <algorithm>
+    4|       |#include <cerrno>
+    5|       |#include <charconv>  // defines __cpp_lib_to_chars when floating-point from_chars exists
+    6|       |#include <cstdlib>
+    7|       |#include <format>
+    8|       |#include <optional>
+    9|       |#include <span>
+   10|       |#include <string>
+   11|       |#include <utility>
+   12|       |#include <variant>
+   13|       |#include <vector>
+   14|       |
+   15|       |#include "lexer.hpp"
+   16|       |#include "sheet/sheet.hpp"
+   17|       |
+   18|       |namespace sheet {
+   19|       |namespace {
+   20|       |
+   21|       |using detail::Token;
+   22|       |using detail::TokenKind;
+   23|       |
+   24|       |// Deeper input is rejected rather than risking stack exhaustion, both while
+   25|       |// parsing (recursion depth) and in later stages, which walk the tree
+   26|       |// recursively (tree height; long chains such as 1+1+...+1 are deep trees
+   27|       |// even though the parser builds them with a loop).
+   28|       |inline constexpr std::size_t max_nesting_depth = 256;
+   29|       |inline constexpr std::uint32_t max_tree_height = 256;
+   30|       |
+   31|     75|[[nodiscard]] auto parse_number(std::string_view text) -> std::optional<double> {
+   32|     75|#if defined(__cpp_lib_to_chars)
+   33|     75|  double value = 0.0;
+   34|     75|  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+   35|     75|  if (error != std::errc{} || end != text.data() + text.size()) {
+   36|      0|    return std::nullopt;
+   37|      0|  }
+   38|     75|  return value;
+   39|       |#else
+   40|       |  // Fallback for standard libraries without floating-point from_chars.
+   41|       |  const std::string copy{text};
+   42|       |  char* end = nullptr;
+   43|       |  errno = 0;
+   44|       |  const double value = std::strtod(copy.c_str(), &end);
+   45|       |  if (errno == ERANGE || end != copy.c_str() + copy.size()) {
+   46|       |    return std::nullopt;
+   47|       |  }
+   48|       |  return value;
+   49|       |#endif
+   50|     75|}
+   51|       |
+   52|       |// Parses names such as "B12": uppercase column letters, then a row number
+   53|       |// without leading zeros. Returns nullopt for anything else or out of range.
+   54|    180|[[nodiscard]] auto parse_cell_name(std::string_view text) -> std::optional<CellRef> {
+   55|    180|  std::size_t letters = 0;
+   56|    366|  while (letters < text.size() && text[letters] >= 'A' && text[letters] <= 'Z') {
+   57|    186|    ++letters;
+   58|    186|  }
+   59|    180|  const auto digits = text.substr(letters);
+   60|    180|  if (letters == 0 || digits.empty() || digits.front() == '0') {
+   61|      2|    return std::nullopt;
+   62|      2|  }
+   63|       |
+   64|       |  // Bijective base 26: A = 1 ... Z = 26, AA = 27; the stored index is 0-based.
+   65|    178|  std::uint64_t column = 0;
+   66|    184|  for (const char c : text.substr(0, letters)) {
+   67|    184|    column = column * 26 + static_cast<std::uint64_t>(c - 'A' + 1);
+   68|    184|  }
+   69|       |
+   70|    178|  std::uint64_t row = 0;
+   71|    183|  for (const char c : digits) {
+   72|    183|    if (c < '0' || c > '9') {
+   73|      0|      return std::nullopt;
+   74|      0|    }
+   75|    183|    row = row * 10 + static_cast<std::uint64_t>(c - '0');
+   76|    183|    if (row > max_row_number) {
+   77|      0|      return std::nullopt;
+   78|      0|    }
+   79|    183|  }
+   80|    178|  return CellRef{Column{static_cast<std::uint32_t>(column - 1)},
+   81|    178|                 Row{static_cast<std::uint32_t>(row)}};
+   82|    178|}
+   83|       |
+   84|       |class DepthGuard {
+   85|       |public:
+   86|    348|  explicit DepthGuard(std::size_t& depth) noexcept : depth_{depth} { ++depth_; }
+   87|    348|  ~DepthGuard() { --depth_; }
+   88|       |  DepthGuard(const DepthGuard&) = delete;
+   89|       |  auto operator=(const DepthGuard&) -> DepthGuard& = delete;
+   90|       |  DepthGuard(DepthGuard&&) = delete;
+   91|       |  auto operator=(DepthGuard&&) -> DepthGuard& = delete;
+   92|       |
+   93|       |private:
+   94|       |  std::size_t& depth_;
+   95|       |};
+   96|       |
+   97|       |class Parser {
+   98|       |public:
+   99|     37|  Parser(std::span<const Token> tokens, Ast& ast) noexcept : tokens_{tokens}, ast_{&ast} {}
+  100|       |
+  101|     37|  auto parse_sheet() -> std::expected<void, Diagnostic> {
+  102|    138|    while (true) {
+  103|    251|      while (check(TokenKind::Newline)) {
+  104|    113|        advance();
+  105|    113|      }
+  106|    138|      if (check(TokenKind::End)) {
+  107|     23|        return {};
+  108|     23|      }
+  109|    115|      if (auto line = parse_definition(); !line) {
+  110|     14|        return line;
+  111|     14|      }
+  112|    115|    }
+  113|     37|  }
+  114|       |
+  115|       |private:
+  116|       |  using NodeResult = std::expected<NodeId, Diagnostic>;
+  117|       |
+  118|  2.87k|  [[nodiscard]] auto current() const -> const Token& { return tokens_[position_]; }
+  119|    108|  [[nodiscard]] auto peek_kind(std::size_t ahead) const -> TokenKind {
+  120|    108|    const auto index = position_ + ahead;
+  121|    108|    return index < tokens_.size() ? tokens_[index].kind : TokenKind::End;
+  122|    108|  }
+  123|  1.50k|  [[nodiscard]] auto check(TokenKind kind) const -> bool { return current().kind == kind; }
+  124|       |
+  125|    669|  auto advance() -> const Token& {
+  126|    669|    const Token& token = current();
+  127|    669|    if (token.kind != TokenKind::End) {
+  128|    669|      ++position_;
+  129|    669|    }
+  130|    669|    return token;
+  131|    669|  }
+  132|       |
+  133|     14|  [[nodiscard]] auto error(std::string message) const -> Diagnostic {
+  134|     14|    return Diagnostic{Stage::Parse, std::move(message), current().location};
+  135|     14|  }
+  136|       |
+  137|     12|  [[nodiscard]] auto unexpected_token(std::string_view expected) const -> Diagnostic {
+  138|     12|    return error(std::format("expected {}, found {}", expected, detail::to_string(current().kind)));
+  139|     12|  }
+  140|       |
+  141|    142|  auto expect(TokenKind kind) -> std::expected<Token, Diagnostic> {
+  142|    142|    if (!check(kind)) {
+  143|      6|      return std::unexpected(unexpected_token(detail::to_string(kind)));
+  144|      6|    }
+  145|    136|    return advance();
+  146|    142|  }
+  147|       |
+  148|    182|  auto parse_cell(std::string_view role) -> std::expected<std::pair<CellRef, SourceLocation>, Diagnostic> {
+  149|    182|    if (!check(TokenKind::Identifier)) {
+  150|      2|      return std::unexpected(unexpected_token(role));
+  151|      2|    }
+  152|    180|    const Token& token = current();
+  153|    180|    const auto ref = parse_cell_name(token.text);
+  154|    180|    if (!ref) {
+  155|      2|      return std::unexpected(error(std::format("invalid cell reference '{}'", token.text)));
+  156|      2|    }
+  157|    178|    advance();
+  158|    178|    return std::pair{*ref, token.location};
+  159|    180|  }
+  160|       |
+  161|    115|  auto parse_definition() -> std::expected<void, Diagnostic> {
+  162|    115|    auto target = parse_cell("a cell name");
+  163|    115|    if (!target) {
+  164|      2|      return std::unexpected(std::move(target).error());
+  165|      2|    }
+  166|    113|    if (auto assign = expect(TokenKind::Assign); !assign) {
+  167|      4|      return std::unexpected(std::move(assign).error());
+  168|      4|    }
+  169|    109|    auto expression = parse_expression();
+  170|    109|    if (!expression) {
+  171|      7|      return std::unexpected(std::move(expression).error());
+  172|      7|    }
+  173|    102|    if (!check(TokenKind::Newline) && !check(TokenKind::End)) {
+  174|      1|      return std::unexpected(unexpected_token("end of line"));
+  175|      1|    }
+  176|    101|    ast_->add_cell(CellDefinition{target->first, *expression, target->second});
+  177|    101|    return {};
+  178|    102|  }
+  179|       |
+  180|    152|  auto parse_expression() -> NodeResult {
+  181|    152|    const DepthGuard guard{depth_};
+  182|    152|    if (depth_ > max_nesting_depth) {
+  183|      0|      return std::unexpected(error("expression is nested too deeply"));
+  184|      0|    }
+  185|    152|    auto lhs = parse_additive();
+  186|    152|    if (!lhs) {
+  187|      7|      return lhs;
+  188|      7|    }
+  189|    145|    const auto op = comparison_op(current().kind);
+  190|    145|    if (!op) {
+  191|    131|      return lhs;
+  192|    131|    }
+  193|     14|    const auto location = advance().location;
+  194|     14|    auto rhs = parse_additive();
+  195|     14|    if (!rhs) {
+  196|      1|      return rhs;
+  197|      1|    }
+  198|     13|    return make(Binary{*op, *lhs, *rhs}, location);
+  199|     14|  }
+  200|       |
+  201|    166|  auto parse_additive() -> NodeResult {
+  202|    166|    auto lhs = parse_term();
+  203|    177|    while (lhs) {
+  204|    169|      const auto op = additive_op(current().kind);
+  205|    169|      if (!op) {
+  206|    158|        break;
+  207|    158|      }
+  208|     11|      const auto location = advance().location;
+  209|     11|      auto rhs = parse_term();
+  210|     11|      if (!rhs) {
+  211|      0|        return rhs;
+  212|      0|      }
+  213|     11|      lhs = make(Binary{*op, *lhs, *rhs}, location);
+  214|     11|    }
+  215|    166|    return lhs;
+  216|    166|  }
+  217|       |
+  218|    177|  auto parse_term() -> NodeResult {
+  219|    177|    auto lhs = parse_unary();
+  220|    187|    while (lhs && (check(TokenKind::Star) || check(TokenKind::Slash))) {
+  221|     10|      const auto op = check(TokenKind::Star) ? BinaryOp::Mul : BinaryOp::Div;
+  222|     10|      const auto location = advance().location;
+  223|     10|      auto rhs = parse_unary();
+  224|     10|      if (!rhs) {
+  225|      0|        return rhs;
+  226|      0|      }
+  227|     10|      lhs = make(Binary{op, *lhs, *rhs}, location);
+  228|     10|    }
+  229|    177|    return lhs;
+  230|    177|  }
+  231|       |
+  232|    196|  auto parse_unary() -> NodeResult {
+  233|    196|    const DepthGuard guard{depth_};
+  234|    196|    if (depth_ > max_nesting_depth) {
+  235|      0|      return std::unexpected(error("expression is nested too deeply"));
+  236|      0|    }
+  237|    196|    if (!check(TokenKind::Minus)) {
+  238|    187|      return parse_primary();
+  239|    187|    }
+  240|      9|    const auto location = advance().location;
+  241|      9|    auto operand = parse_unary();
+  242|      9|    if (!operand) {
+  243|      0|      return operand;
+  244|      0|    }
+  245|      9|    return make(Negate{*operand}, location);
+  246|      9|  }
+  247|       |
+  248|    187|  auto parse_primary() -> NodeResult {
+  249|    187|    const Token& token = current();
+  250|    187|    switch (token.kind) {
+  251|     75|      case TokenKind::Number: {
+  252|     75|        const auto value = parse_number(token.text);
+  253|     75|        if (!value) {
+  254|      0|          return std::unexpected(error(std::format("invalid number '{}'", token.text)));
+  255|      0|        }
+  256|     75|        advance();
+  257|     75|        return make(NumberLiteral{*value}, token.location);
+  258|     75|      }
+  259|     26|      case TokenKind::String:
+  260|     26|        advance();
+  261|     26|        return make(StringLiteral{detail::decode_string(token.text)}, token.location);
+  262|      0|      case TokenKind::Plus: {
+  263|      0|        auto operand = parse_primary();
+  264|      0|        if (!operand) {
+  265|      0|          return operand;
+  266|      0|        }
+  267|      0|        return make(UnaryPlus{*operand}, token.location);
+  268|      0|      }
+  269|      2|      case TokenKind::LParen: {
+  270|      2|        advance();
+  271|      2|        auto inner = parse_expression();
+  272|      2|        if (!inner) {
+  273|      0|          return inner;
+  274|      0|        }
+  275|      2|        if (auto close = expect(TokenKind::RParen); !close) {
+  276|      0|          return std::unexpected(std::move(close).error());
+  277|      0|        }
+  278|      2|        return inner;
+  279|      2|      }
+  280|     81|      case TokenKind::Identifier:
+  281|     81|        if (peek_kind(1) == TokenKind::LParen) {
+  282|     28|          return parse_call();
+  283|     28|        }
+  284|     53|        if (token.text == "TRUE" || token.text == "FALSE") {
+  285|      6|          advance();
+  286|      6|          return make(BoolLiteral{token.text == "TRUE"}, token.location);
+  287|      6|        }
+  288|     47|        return parse_cell_reference();
+  289|      3|      default:
+  290|      3|        return std::unexpected(unexpected_token("a value"));
+  291|    187|    }
+  292|    187|  }
+  293|       |
+  294|     47|  auto parse_cell_reference() -> NodeResult {
+  295|     47|    auto cell = parse_cell("a value");
+  296|     47|    if (!cell) {
+  297|      2|      return std::unexpected(std::move(cell).error());
+  298|      2|    }
+  299|     45|    return make(CellReference{cell->first}, cell->second);
+  300|     47|  }
+  301|       |
+  302|     28|  auto parse_call() -> NodeResult {
+  303|     28|    const Token& name = advance();
+  304|     28|    advance();  // '('
+  305|     28|    Call call{.name = name.text, .arguments = {}};
+  306|     28|    if (!check(TokenKind::RParen)) {
+  307|     51|      while (true) {
+  308|     51|        auto argument = parse_argument();
+  309|     51|        if (!argument) {
+  310|      1|          return argument;
+  311|      1|        }
+  312|     50|        call.arguments.push_back(*argument);
+  313|     50|        if (!check(TokenKind::Comma)) {
+  314|     27|          break;
+  315|     27|        }
+  316|     23|        advance();
+  317|     23|      }
+  318|     28|    }
+  319|     27|    if (auto close = expect(TokenKind::RParen); !close) {
+  320|      2|      return std::unexpected(std::move(close).error());
+  321|      2|    }
+  322|     25|    return make(std::move(call), name.location);
+  323|     27|  }
+  324|       |
+  325|       |  // A range (B1:B9) is only allowed as a function argument.
+  326|     51|  auto parse_argument() -> NodeResult {
+  327|     51|    if (check(TokenKind::Identifier) && peek_kind(1) == TokenKind::Colon) {
+  328|     10|      auto first = parse_cell("a cell name");
+  329|     10|      if (!first) {
+  330|      0|        return std::unexpected(std::move(first).error());
+  331|      0|      }
+  332|     10|      advance();  // ':'
+  333|     10|      auto last = parse_cell("a cell name");
+  334|     10|      if (!last) {
+  335|      0|        return std::unexpected(std::move(last).error());
+  336|      0|      }
+  337|     10|      return make(RangeReference{first->first, last->first}, first->second);
+  338|     10|    }
+  339|     41|    return parse_expression();
+  340|     51|  }
+  341|       |
+  342|       |  // Adds a node to the Ast, rejecting trees that grow too tall.
+  343|    230|  auto make(Node node, SourceLocation location) -> NodeResult {
+  344|    230|    std::uint32_t children = 0;
+  345|    230|    const auto child = [&](NodeId id) { children = std::max(children, heights_[id.value]); };
+  346|    230|    if (const auto* negate = std::get_if<Negate>(&node)) {
+  347|      9|      child(negate->operand);
+  348|    221|    } else if (const auto* plus = std::get_if<UnaryPlus>(&node)) {
+  349|      0|      child(plus->operand);
+  350|    221|    } else if (const auto* binary = std::get_if<Binary>(&node)) {
+  351|     34|      child(binary->lhs);
+  352|     34|      child(binary->rhs);
+  353|    187|    } else if (const auto* call = std::get_if<Call>(&node)) {
+  354|     25|      std::ranges::for_each(call->arguments, child);
+  355|     25|    }
+  356|    230|    const auto height = children + 1;
+  357|    230|    if (height > max_tree_height) {
+  358|      0|      return std::unexpected(Diagnostic{Stage::Parse, "expression is nested too deeply", location});
+  359|      0|    }
+  360|    230|    heights_.push_back(height);
+  361|    230|    return ast_->add(std::move(node), location);
+  362|    230|  }
+  363|       |
+  364|    145|  [[nodiscard]] static auto comparison_op(TokenKind kind) -> std::optional<BinaryOp> {
+  365|    145|    switch (kind) {
+  366|      5|      case TokenKind::EqEq: return BinaryOp::Eq;
+  367|      1|      case TokenKind::NotEq: return BinaryOp::Ne;
+  368|      2|      case TokenKind::Lt: return BinaryOp::Lt;
+  369|      4|      case TokenKind::Gt: return BinaryOp::Gt;
+  370|      0|      case TokenKind::Le: return BinaryOp::Le;
+  371|      2|      case TokenKind::Ge: return BinaryOp::Ge;
+  372|    131|      default: return std::nullopt;
+  373|    145|    }
+  374|    145|  }
+  375|       |
+  376|    169|  [[nodiscard]] static auto additive_op(TokenKind kind) -> std::optional<BinaryOp> {
+  377|    169|    switch (kind) {
+  378|      3|      case TokenKind::Plus: return BinaryOp::Add;
+  379|      5|      case TokenKind::Minus: return BinaryOp::Sub;
+  380|      3|      case TokenKind::Amp: return BinaryOp::Concat;
+  381|    158|      default: return std::nullopt;
+  382|    169|    }
+  383|    169|  }
+  384|       |
+  385|       |  std::span<const Token> tokens_;
+  386|       |  std::size_t position_ = 0;
+  387|       |  std::size_t depth_ = 0;
+  388|       |  std::vector<std::uint32_t> heights_;  // by node id
+  389|       |  Ast* ast_;  // never null
+  390|       |};
+  391|       |
+  392|       |}  // namespace
+  393|       |
+  394|     44|auto parse(std::string_view source) -> std::expected<Ast, Diagnostic> {
+  395|     44|  Ast ast{std::string{source}};
+  396|       |  // Lex the Ast's own copy so token views stay valid inside the Ast.
+  397|     44|  const auto text = ast.source();
+  398|       |
+  399|     44|  auto body = detail::check_header(text);
+  400|     44|  if (!body) {
+  401|      2|    return std::unexpected(std::move(body).error());
+  402|      2|  }
+  403|     42|  auto tokens = detail::lex(text, *body);
+  404|     42|  if (!tokens) {
+  405|      5|    return std::unexpected(std::move(tokens).error());
+  406|      5|  }
+  407|     37|  if (auto parsed = Parser{*tokens, ast}.parse_sheet(); !parsed) {
+  408|     14|    return std::unexpected(std::move(parsed).error());
+  409|     14|  }
+  410|     23|  return ast;
+  411|     37|}
+  412|       |
+  413|       |}  // namespace sheet
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/invariant.cpp:
+    1|       |#include "invariant.hpp"
+    2|       |
+    3|       |#include <cstdlib>
+    4|       |#include "sheet/print.hpp"
+    5|       |
+    6|       |namespace sheet::detail {
+    7|       |
+    8|      0|auto invariant_failure(std::string_view message, std::source_location where) -> void {
+    9|       |  sheet::println(stderr, "sheet: invariant violated at {}:{}: {}", where.file_name(), where.line(),
+   10|      0|               message);
+   11|      0|  std::abort();
+   12|      0|}
+   13|       |
+   14|       |}  // namespace sheet::detail
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/lexer.cpp:
+    1|       |#include "lexer.hpp"
+    2|       |
+    3|       |#include <format>
+    4|       |#include <string>
+    5|       |#include <utility>
+    6|       |
+    7|       |namespace sheet::detail {
+    8|       |namespace {
+    9|       |
+   10|  1.52k|[[nodiscard]] constexpr auto is_digit(char c) noexcept -> bool { return c >= '0' && c <= '9'; }
+   11|       |
+   12|  1.53k|[[nodiscard]] constexpr auto is_alpha(char c) noexcept -> bool {
+   13|  1.53k|  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+   14|  1.53k|}
+   15|       |
+   16|    907|[[nodiscard]] constexpr auto is_identifier_char(char c) noexcept -> bool {
+   17|    907|  return is_alpha(c) || is_digit(c) || c == '_';
+   18|    907|}
+   19|       |
+   20|       |class Lexer {
+   21|       |public:
+   22|       |  Lexer(std::string_view source, std::size_t offset) noexcept
+   23|     42|      : source_{source}, position_{offset} {}
+   24|       |
+   25|     42|  auto run() -> std::expected<std::vector<Token>, Diagnostic> {
+   26|  1.34k|    while (!at_end()) {
+   27|  1.31k|      const char c = peek();
+   28|  1.31k|      if (c == ' ' || c == '\t' || c == '\r') {
+   29|    414|        advance();
+   30|    897|      } else if (c == '#') {
+   31|     12|        skip_comment();
+   32|    885|      } else if (c == '\n') {
+   33|    149|        emit(TokenKind::Newline, 1);
+   34|    736|      } else if (is_digit(c)) {
+   35|    106|        lex_number();
+   36|    630|      } else if (is_alpha(c)) {
+   37|    271|        lex_identifier();
+   38|    359|      } else if (c == '"') {
+   39|     28|        if (auto status = lex_string(); !status) {
+   40|      0|          return std::unexpected(std::move(status).error());
+   41|      0|        }
+   42|    331|      } else if (auto status = lex_punctuation(); !status) {
+   43|      5|        return std::unexpected(std::move(status).error());
+   44|      5|      }
+   45|  1.31k|    }
+   46|     37|    tokens_.push_back(Token{TokenKind::End, source_.substr(position_, 0), location_});
+   47|     37|    return std::move(tokens_);
+   48|     42|  }
+   49|       |
+   50|       |private:
+   51|  1.66k|  [[nodiscard]] auto at_end() const noexcept -> bool { return position_ >= source_.size(); }
+   52|  1.96k|  [[nodiscard]] auto peek() const -> char { return source_[position_]; }
+   53|    331|  [[nodiscard]] auto peek_next() const -> char {
+   54|    331|    return position_ + 1 < source_.size() ? source_[position_ + 1] : '\0';
+   55|    331|  }
+   56|       |
+   57|  2.19k|  auto advance() -> void {
+   58|  2.19k|    if (source_[position_] == '\n') {
+   59|    149|      ++location_.line;
+   60|    149|      location_.column = 1;
+   61|  2.04k|    } else {
+   62|  2.04k|      ++location_.column;
+   63|  2.04k|    }
+   64|  2.19k|    ++position_;
+   65|  2.19k|  }
+   66|       |
+   67|    880|  auto emit(TokenKind kind, std::size_t length) -> void {
+   68|    880|    tokens_.push_back(Token{kind, source_.substr(position_, length), location_});
+   69|  2.35k|    for (std::size_t i = 0; i < length; ++i) {
+   70|  1.47k|      advance();
+   71|  1.47k|    }
+   72|    880|  }
+   73|       |
+   74|      5|  [[nodiscard]] auto error(std::string message) const -> Diagnostic {
+   75|      5|    return Diagnostic{Stage::Lex, std::move(message), location_};
+   76|      5|  }
+   77|       |
+   78|     12|  auto skip_comment() -> void {
+   79|    319|    while (!at_end() && peek() != '\n') {
+   80|    307|      advance();
+   81|    307|    }
+   82|     12|  }
+   83|       |
+   84|    106|  auto lex_number() -> void {
+   85|    106|    auto end = position_;
+   86|    122|    const auto digits = [&] {
+   87|    272|      while (end < source_.size() && is_digit(source_[end])) {
+   88|    150|        ++end;
+   89|    150|      }
+   90|    122|    };
+   91|    106|    digits();
+   92|    106|    if (end + 1 < source_.size() && source_[end] == '.' && is_digit(source_[end + 1])) {
+   93|     11|      ++end;
+   94|     11|      digits();
+   95|     11|    }
+   96|    106|    if (end < source_.size() && (source_[end] == 'e' || source_[end] == 'E')) {
+   97|      5|      auto exponent = end + 1;
+   98|      5|      if (exponent < source_.size() && (source_[exponent] == '+' || source_[exponent] == '-')) {
+   99|      0|        ++exponent;
+  100|      0|      }
+  101|      5|      if (exponent < source_.size() && is_digit(source_[exponent])) {
+  102|      5|        end = exponent;
+  103|      5|        digits();
+  104|      5|      }
+  105|      5|    }
+  106|    106|    emit(TokenKind::Number, end - position_);
+  107|    106|  }
+  108|       |
+  109|    271|  auto lex_identifier() -> void {
+  110|    271|    auto end = position_;
+  111|    907|    while (end < source_.size() && is_identifier_char(source_[end])) {
+  112|    636|      ++end;
+  113|    636|    }
+  114|    271|    emit(TokenKind::Identifier, end - position_);
+  115|    271|  }
+  116|       |
+  117|     28|  auto lex_string() -> std::expected<void, Diagnostic> {
+  118|     28|    auto end = position_ + 1;  // past the opening quote
+  119|    155|    while (end < source_.size()) {
+  120|    155|      const char c = source_[end];
+  121|    155|      if (c == '"') {
+  122|     28|        emit(TokenKind::String, end + 1 - position_);
+  123|     28|        return {};
+  124|     28|      }
+  125|    127|      if (c == '\n') {
+  126|      0|        break;
+  127|      0|      }
+  128|    127|      if (c == '\\') {
+  129|      6|        const char escaped = source_[end + 1];
+  130|      6|        if (escaped != '"' && escaped != '\\' && escaped != 'n' && escaped != 't') {
+  131|      0|          return std::unexpected(error(std::format("unknown escape '\\{}'", escaped)));
+  132|      0|        }
+  133|      6|        end += 2;
+  134|      6|        continue;
+  135|      6|      }
+  136|    121|      ++end;
+  137|    121|    }
+  138|      0|    return std::unexpected(error("unterminated string literal"));
+  139|     28|  }
+  140|       |
+  141|    331|  auto lex_punctuation() -> std::expected<void, Diagnostic> {
+  142|    331|    const char c = peek();
+  143|    331|    const char next = peek_next();
+  144|    331|    switch (c) {
+  145|     13|      case ':': emit(TokenKind::Colon, 1); return {};
+  146|     32|      case ',': emit(TokenKind::Comma, 1); return {};
+  147|     41|      case '(': emit(TokenKind::LParen, 1); return {};
+  148|     40|      case ')': emit(TokenKind::RParen, 1); return {};
+  149|      5|      case '+': emit(TokenKind::Plus, 1); return {};
+  150|     25|      case '-': emit(TokenKind::Minus, 1); return {};
+  151|     12|      case '*': emit(TokenKind::Star, 1); return {};
+  152|      4|      case '/': emit(TokenKind::Slash, 1); return {};
+  153|      6|      case '&': emit(TokenKind::Amp, 1); return {};
+  154|    138|      case '=':
+  155|    138|        next == '=' ? emit(TokenKind::EqEq, 2) : emit(TokenKind::Assign, 1);
+  156|    138|        return {};
+  157|      3|      case '<':
+  158|      3|        if (next == '>') {
+  159|      1|          emit(TokenKind::NotEq, 2);
+  160|      2|        } else {
+  161|      2|          next == '=' ? emit(TokenKind::Le, 2) : emit(TokenKind::Lt, 1);
+  162|      2|        }
+  163|      3|        return {};
+  164|      7|      case '>':
+  165|      7|        next == '=' ? emit(TokenKind::Ge, 2) : emit(TokenKind::Gt, 1);
+  166|      7|        return {};
+  167|      5|      default: break;
+  168|    331|    }
+  169|      5|    const auto byte = static_cast<unsigned>(static_cast<unsigned char>(c));
+  170|      5|    return std::unexpected(error(std::format("unexpected character (byte 0x{:02x})", byte)));
+  171|    331|  }
+  172|       |
+  173|       |  std::string_view source_;
+  174|       |  std::size_t position_;
+  175|       |  SourceLocation location_{.line = 2, .column = 1};
+  176|       |  std::vector<Token> tokens_;
+  177|       |};
+  178|       |
+  179|       |}  // namespace
+  180|       |
+  181|     18|auto to_string(TokenKind kind) -> std::string_view {
+  182|     18|  switch (kind) {
+  183|      1|    case TokenKind::Number: return "number";
+  184|      0|    case TokenKind::String: return "string";
+  185|      2|    case TokenKind::Identifier: return "name";
+  186|      0|    case TokenKind::Colon: return "':'";
+  187|      0|    case TokenKind::Comma: return "','";
+  188|      1|    case TokenKind::LParen: return "'('";
+  189|      2|    case TokenKind::RParen: return "')'";
+  190|      0|    case TokenKind::Plus: return "'+'";
+  191|      3|    case TokenKind::Minus: return "'-'";
+  192|      1|    case TokenKind::Star: return "'*'";
+  193|      0|    case TokenKind::Slash: return "'/'";
+  194|      2|    case TokenKind::Amp: return "'&'";
+  195|      6|    case TokenKind::Assign: return "'='";
+  196|      0|    case TokenKind::EqEq: return "'=='";
+  197|      0|    case TokenKind::NotEq: return "'<>'";
+  198|      0|    case TokenKind::Lt: return "'<'";
+  199|      0|    case TokenKind::Gt: return "'>'";
+  200|      0|    case TokenKind::Le: return "'<='";
+  201|      0|    case TokenKind::Ge: return "'>='";
+  202|      0|    case TokenKind::Newline: return "end of line";
+  203|      0|    case TokenKind::End: return "end of input";
+  204|     18|  }
+  205|      0|  return "token";
+  206|     18|}
+  207|       |
+  208|     44|auto check_header(std::string_view source) -> std::expected<std::size_t, Diagnostic> {
+  209|     44|  const auto newline = source.find('\n');
+  210|     44|  auto first_line = source.substr(0, newline);
+  211|     44|  if (first_line.ends_with('\r')) {
+  212|      2|    first_line.remove_suffix(1);
+  213|      2|  }
+  214|     44|  if (first_line != header_line) {
+  215|      2|    return std::unexpected(Diagnostic{
+  216|      2|        Stage::Header, std::format("expected '{}' on the first line", header_line), {}});
+  217|      2|  }
+  218|     42|  return newline == std::string_view::npos ? source.size() : newline + 1;
+  219|     44|}
+  220|       |
+  221|       |auto lex(std::string_view source, std::size_t offset)
+  222|     42|    -> std::expected<std::vector<Token>, Diagnostic> {
+  223|     42|  return Lexer{source, offset}.run();
+  224|     42|}
+  225|       |
+  226|     26|auto decode_string(std::string_view quoted) -> std::string {
+  227|       |  // The lexer guarantees the quotes and that every backslash starts a
+  228|       |  // complete, known escape.
+  229|     26|  const auto body = quoted.substr(1, quoted.size() - 2);
+  230|     26|  std::string decoded;
+  231|     26|  decoded.reserve(body.size());
+  232|    146|  for (std::size_t i = 0; i < body.size(); ++i) {
+  233|    120|    if (body[i] != '\\') {
+  234|    114|      decoded.push_back(body[i]);
+  235|    114|      continue;
+  236|    114|    }
+  237|      6|    ++i;
+  238|      6|    switch (body[i]) {
+  239|      2|      case 'n': decoded.push_back('\n'); break;
+  240|      1|      case 't': decoded.push_back('\t'); break;
+  241|      3|      default: decoded.push_back(body[i]); break;
+  242|      6|    }
+  243|      6|  }
+  244|     26|  return decoded;
+  245|     26|}
+  246|       |
+  247|       |}  // namespace sheet::detail
+
+/home/dva11/sfuhome/se-random-testing-template/sheet/src/resolve.cpp:
+    1|       |// Stage Resolve: unique definitions, references to defined cells, and known
+    2|       |// functions called with a valid number of arguments.
+    3|       |
+    4|       |#include <cstdint>
+    5|       |#include <format>
+    6|       |#include <string>
+    7|       |#include <utility>
+    8|       |#include <variant>
+    9|       |#include <vector>
+   10|       |
+   11|       |#include "analysis.hpp"
+   12|       |#include "functions.hpp"
+   13|       |
+   14|       |namespace sheet::detail {
+   15|       |namespace {
+   16|       |
+   17|       |class Resolver {
+   18|       |public:
+   19|       |  explicit Resolver(const Ast& ast)
+   20|     23|      : ast_{&ast}, columns_in_use_(std::size_t{max_column_index} + 1, 0) {}
+   21|       |
+   22|     23|  auto run() -> std::expected<CellIndex, Diagnostic> {
+   23|     23|    const auto cells = ast_->cells();
+   24|     23|    index_.reserve(cells.size());
+   25|    104|    for (std::size_t i = 0; i < cells.size(); ++i) {
+   26|     81|      const auto& definition = cells[i];
+   27|     81|      if (!index_.emplace(definition.target, i).second) {
+   28|      0|        return std::unexpected(error(
+   29|      0|            std::format("cell {} is defined more than once", to_string(definition.target)),
+   30|      0|            definition.location));
+   31|      0|      }
+   32|     81|      columns_in_use_[definition.target.column.index()] = 1;
+   33|     81|    }
+   34|     81|    for (const auto& definition : cells) {
+   35|     81|      if (auto checked = check_node(definition.expression); !checked) {
+   36|      1|        return std::unexpected(std::move(checked).error());
+   37|      1|      }
+   38|     81|    }
+   39|     22|    return std::move(index_);
+   40|     23|  }
+   41|       |
+   42|       |private:
+   43|      1|  [[nodiscard]] static auto error(std::string message, SourceLocation location) -> Diagnostic {
+   44|      1|    return Diagnostic{Stage::Resolve, std::move(message), location};
+   45|      1|  }
+   46|       |
+   47|       |  // Most references in a typical sheet point at used columns; checking the
+   48|       |  // column first avoids a hash lookup for the rest.
+   49|     39|  [[nodiscard]] auto is_defined(CellRef ref) const -> bool {
+   50|     39|    return columns_in_use_[ref.column.index()] != 0 && index_.contains(ref);
+   51|     39|  }
+   52|       |
+   53|    191|  auto check_node(NodeId id) -> std::expected<void, Diagnostic> {
+   54|    191|    const auto& node = ast_->node(id);
+   55|    191|    if (const auto* cell = std::get_if<CellReference>(&node)) {
+   56|     39|      if (!is_defined(cell->ref)) {
+   57|      1|        return std::unexpected(
+   58|      1|            error(std::format("reference to undefined cell {}", to_string(cell->ref)),
+   59|      1|                  ast_->location(id)));
+   60|      1|      }
+   61|    152|    } else if (const auto* negate = std::get_if<Negate>(&node)) {
+   62|      5|      return check_node(negate->operand);
+   63|    147|    } else if (const auto* plus = std::get_if<UnaryPlus>(&node)) {
+   64|      0|      return check_node(plus->operand);
+   65|    147|    } else if (const auto* binary = std::get_if<Binary>(&node)) {
+   66|     30|      if (auto lhs = check_node(binary->lhs); !lhs) {
+   67|      0|        return lhs;
+   68|      0|      }
+   69|     30|      return check_node(binary->rhs);
+   70|    117|    } else if (const auto* call = std::get_if<Call>(&node)) {
+   71|     25|      return check_call(*call, ast_->location(id));
+   72|     25|    }
+   73|       |    // Literals need nothing; a range may cover undefined (empty) cells.
+   74|    130|    return {};
+   75|    191|  }
+   76|       |
+   77|     25|  auto check_call(const Call& call, SourceLocation location) -> std::expected<void, Diagnostic> {
+   78|     25|    const auto spec = find_function(call.name);
+   79|     25|    if (!spec) {
+   80|      0|      return std::unexpected(error(std::format("unknown function {}", call.name), location));
+   81|      0|    }
+   82|     25|    const auto count = call.arguments.size();
+   83|     25|    if (count < spec->min_arity || count > spec->max_arity) {
+   84|      0|      const auto expected = spec->min_arity == spec->max_arity
+   85|      0|                                ? std::format("{}", spec->min_arity)
+   86|      0|                                : std::format("{} to {}", spec->min_arity, spec->max_arity);
+   87|      0|      return std::unexpected(error(
+   88|      0|          std::format("{} takes {} arguments, not {}", spec->name, expected, count), location));
+   89|      0|    }
+   90|     45|    for (const auto argument : call.arguments) {
+   91|     45|      if (auto checked = check_node(argument); !checked) {
+   92|      0|        return checked;
+   93|      0|      }
+   94|     45|    }
+   95|     25|    return {};
+   96|     25|  }
+   97|       |
+   98|       |  const Ast* ast_;
+   99|       |  CellIndex index_;
+  100|       |  std::vector<std::uint8_t> columns_in_use_;
+  101|       |};
+  102|       |
+  103|       |}  // namespace
+  104|       |
+  105|     23|auto resolve(const Ast& ast) -> std::expected<CellIndex, Diagnostic> {
+  106|     23|  return Resolver{ast}.run();
+  107|     23|}
+  108|       |
+  109|       |}  // namespace sheet::detail
+
