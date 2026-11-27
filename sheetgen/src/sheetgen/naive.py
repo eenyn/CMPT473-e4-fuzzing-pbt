@@ -38,10 +38,10 @@ def generate(rng: random.Random, *, max_depth: int = 20) -> str:
     """
     input = []                  # working list of terminal symbols
     symList = [(START, 0)]      # stack of tuples containing (nonterminal: Symbol, depth: int)
-    debug = True
+    debug = False
 
-    # continue looping until all nonterminals processed
-    while not symList or len(symList) == 0:
+    # continue looping until all symbols processed
+    while symList:
         (symbol, depth) = symList.pop()     # check leftmost symbol
         if debug: print("popping from symList: ("+symbol+","+str(depth)+")")
 
@@ -51,11 +51,13 @@ def generate(rng: random.Random, *, max_depth: int = 20) -> str:
             if depth >= max_depth:
                 if debug: print("max depth reached: "+str(depth)+" >= "+str(max_depth))
                 # choose randomly from cheapest expansions
-                gramTuple = cheapest_expansions(symbol)[rng.randint(0, len(GRAMMAR[symbol])-1)]
+                # gramTuple = cheapest_expansions(symbol)[rng.randint(0, len(GRAMMAR[symbol])-1)]
+                gramTuple = rng.choice(cheapest_expansions(symbol))
             else:
                 if debug: print("depth ok: "+str(depth)+" < "+str(max_depth))
                 # choose randomly from all expansions
-                gramTuple = GRAMMAR[symbol][rng.randint(0, len(GRAMMAR[symbol])-1)]
+                # gramTuple = GRAMMAR[symbol][rng.randint(0, len(GRAMMAR[symbol])-1)]
+                gramTuple = rng.choice(GRAMMAR[symbol])
 
             # push backwards onto stack (leftmost symbol focus)
             if debug: print("gramTuple chosen: ("+','.join(gramTuple)+")")
