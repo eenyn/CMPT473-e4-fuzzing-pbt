@@ -38,27 +38,36 @@ def generate(rng: random.Random, *, max_depth: int = 20) -> str:
     """
     input = []                  # working list of terminal symbols
     symList = [(START, 0)]      # stack of tuples containing (nonterminal: Symbol, depth: int)
+    debug = True
 
     # continue looping until all nonterminals processed
     while not symList or len(symList) == 0:
         (symbol, depth) = symList.pop()     # check leftmost symbol
+        if debug: print("popping from symList: ("+symbol+","+str(depth)+")")
 
         # symbol is nonterminal, process
         if is_nonterminal(symbol):
+            if debug: print("symbol nonterminal: "+symbol)
             if depth >= max_depth:
+                if debug: print("max depth reached: "+str(depth)+" >= "+str(max_depth))
                 # choose randomly from cheapest expansions
                 gramTuple = cheapest_expansions(symbol)[rng.randint(0, len(GRAMMAR[symbol])-1)]
             else:
+                if debug: print("depth ok: "+str(depth)+" < "+str(max_depth))
                 # choose randomly from all expansions
                 gramTuple = GRAMMAR[symbol][rng.randint(0, len(GRAMMAR[symbol])-1)]
 
             # push backwards onto stack (leftmost symbol focus)
+            if debug: print("gramTuple chosen: ("+','.join(gramTuple)+")")
             for newSym in reversed(gramTuple):
+                if debug: print("appending new tuple to symList: ("+newSym+","+str(depth+1)+")")
                 symList.append((newSym, depth+1))
 
         # symbol is terminal, add to generated input
         else:
+            if debug: print("symbol terminal, adding to input: "+symbol)
             input.append(symbol)
+            if debug: print("current input: "+''.join(input))
 
     # recombine strings into generated sheet string
     return ''.join(input)
