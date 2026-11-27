@@ -36,20 +36,49 @@ def generate(rng: random.Random, *, max_depth: int = 20) -> str:
 
     All randomness must come from `rng`, so that a seed reproduces a corpus.
     """
-    # raise NotImplementedError("Phase 2: implement random derivation from GRAMMAR")
-    input = START
-    depth = 0
-    hasNonTerm = True
-    while hasNonTerm:
-      hasNonTerm = False
-      depth += 1
-      for symbol in input:
+    input = []                  # working list of terminal symbols
+    symList = [(START, 0)]      # stack of tuples containing (nonterminal: Symbol, depth: int)
+
+    # continue looping until all nonterminals processed
+    while not symList or len(symList) == 0:
+        (symbol, depth) = symList.pop()     # check leftmost symbol
+
+        # symbol is nonterminal, process
         if is_nonterminal(symbol):
-          hasNonTerm = True
-          if depth > max_depth:
-            symbol = cheapest_expansions(symbol) 
-          else:
-            expOptions = GRAMMAR[symbol]
-            symbol = expOptions[rng.randint(0, GRAMMAR[symbol].__len__-1)]
-    return input
+            if depth >= max_depth:
+                # choose randomly from cheapest expansions
+                gramTuple = cheapest_expansions(symbol)[rng.randint(0, len(GRAMMAR[symbol])-1)]
+            else:
+                # choose randomly from all expansions
+                gramTuple = GRAMMAR[symbol][rng.randint(0, len(GRAMMAR[symbol])-1)]
+
+            # push backwards onto stack (leftmost symbol focus)
+            for newSym in reversed(gramTuple):
+                symList.append((newSym, depth+1))
+
+        # symbol is terminal, add to generated input
+        else:
+            input.append(symbol)
+
+    # recombine strings into generated sheet string
+    return ''.join(input)
+
+    # while not hasNonTerm:
+    #     hasNonTerm = False
+    #     depth += 1
+    #     symList = input.split()
+    #     # iterate thru relevant terms in the string
+    #     for symbol in symList:
+    #         if is_nonterminal(symbol):
+    #             hasNonTerm = True
+    #             if depth > max_depth:
+    #                 # choose randomly from cheapest expansions
+    #                 symbol = cheapest_expansions(symbol)[rng.randint(0, len(GRAMMAR[symbol])-1)]
+    #             else:
+    #                 # choose randomly from all expansions
+    #                 symbol = GRAMMAR[symbol][rng.randint(0, len(GRAMMAR[symbol])-1)]
+    #             break   # focus leftmost symbols first
+    #     # recombine symbols into full string (keep array flat)
+    #     input = ' '.join(symList)
+    # return input
         
